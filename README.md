@@ -4,8 +4,9 @@ Local Python MCP server for automating YouTube uploads through YouTube Data API 
 
 The server exposes tools for listing queued media, competitor research, video details,
 channel verification, uploads, custom thumbnails, and editing existing channel videos.
-OAuth browser login is handled only by `authorize.py`; the MCP stdio server never opens
-a browser.
+OAuth browser login starts automatically from MCP on the first authenticated tool call
+when `token.json` is missing or invalid. `authorize.py` remains available as a manual
+fallback.
 
 ## Tools
 
@@ -62,7 +63,22 @@ cd youtube-upload-mcp
 pip install -r requirements.txt
 ```
 
-## 5. Authorize Once
+The server installs `certifi` and automatically points Python, Requests, and
+httplib2 at that CA bundle when no certificate bundle is already configured.
+You normally do not need to set `SSL_CERT_FILE` manually.
+
+## 5. Authorize
+
+Usually no terminal command is needed. After `credentials.json` is in place, start the
+MCP server and call an authenticated tool such as `get_channel_info`. If `token.json`
+is missing or invalid, the MCP server opens Google OAuth in Chrome, saves `token.json`,
+and then continues the tool call.
+
+If Chrome is installed in a custom location, set `YOUTUBE_MCP_CHROME_PATH` to the full
+path of the Chrome executable. If Chrome cannot be found, the system default browser is
+used.
+
+Manual fallback:
 
 ```bash
 python authorize.py

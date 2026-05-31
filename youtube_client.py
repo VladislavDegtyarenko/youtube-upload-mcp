@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import inspect
 import json
+import os
+import shutil
+import sys
+import webbrowser
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,6 +34,8 @@ QUOTA_REASONS = {
     "rateLimitExceeded",
 }
 
+CERTIFICATE_ENV_VARS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "HTTPLIB2_CA_CERTS")
+
 
 def error_payload(code: str, **fields: Any) -> dict[str, Any]:
     payload = {"error": code}
@@ -39,7 +46,7 @@ def error_payload(code: str, **fields: Any) -> dict[str, Any]:
 def reauth_required() -> dict[str, str]:
     return {
         "error": "reauth_required",
-        "hint": "run: python authorize.py",
+        "hint": "OAuth should open automatically from MCP. Manual fallback: python authorize.py",
     }
 
 
@@ -49,6 +56,191 @@ def dependency_missing(package: str) -> dict[str, str]:
         "package": package,
         "hint": "run: pip install -r requirements.txt",
     }
+
+
+def oauth_credentials_missing(credentials_path: str | Path = CREDENTIALS_PATH) -> dict[str, Any]:
+    return error_payload(
+        "oauth_credentials_missing",
+        path=str(credentials_path),
+        hint="Download a Desktop OAuth client JSON from Google Cloud Console and save it as credentials.json.",
+    )
+
+
+def configure_ssl_certificates(
+    certifi_where: Callable[[], str] | None = None,
+) -> dict[str, Any]:
+    """Point Google HTTP stacks at a reliable CA bundle when one is not configured."""
+    bundle_path = next((os.environ[name] for name in CERTIFICATE_ENV_VARS if os.environ.get(name)), None)
+    source = "environment" if bundle_path else "certifi"
+
+    if bundle_path is None:
+        if certifi_where is None:
+            try:
+                import certifi
+            except ImportError:
+                return {
+                    "configured": False,
+                    "reason": "certifi_missing",
+                    "hint": "run: pip install -r requirements.txt",
+                }
+
+            certifi_where = certifi.where
+
+        try:
+            bundle_path = certifi_where()
+        except Exception as exc:
+            return {
+                "configured": False,
+                "reason": "certifi_unavailable",
+                "message": str(exc),
+            }
+
+    bundle_path = str(bundle_path)
+    for name in CERTIFICATE_ENV_VARS:
+        os.environ.setdefault(name, bundle_path)
+
+    return {
+        "configured": True,
+        "path": bundle_path,
+        "source": source,
+        "env_vars": list(CERTIFICATE_ENV_VARS),
+    }
+
+
+def _find_chrome_executable() -> str | None:
+    custom_path = os.environ.get("YOUTUBE_MCP_CHROME_PATH")
+    if custom_path:
+        path = Path(custom_path).expanduser()
+        if path.exists():
+            return str(path)
+
+    candidates: list[Path] = []
+    if os.name == "nt":
+        for env_name in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+            root = os.environ.get(env_name)
+            if root:
+                candidates.append(Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe")
+    elif sys.platform == "darwin":
+        candidates.append(Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+    else:
+        for executable in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+            found = shutil.which(executable)
+            if found:
+                return found
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _open_in_chrome_or_default(
+    url: str,
+    new: int = 1,
+    autoraise: bool = True,
+    fallback_open: Callable[..., bool] | None = None,
+) -> bool:
+    chrome_path = _find_chrome_executable()
+    if chrome_path:
+        try:
+            return bool(webbrowser.BackgroundBrowser(chrome_path).open(url, new=new, autoraise=autoraise))
+        except Exception:
+            pass
+
+    opener = fallback_open or webbrowser.open
+    return bool(opener(url, new=new, autoraise=autoraise))
+
+
+def _register_chrome_browser() -> str | None:
+    chrome_path = _find_chrome_executable()
+    if not chrome_path:
+        return None
+
+    browser_name = "youtube_mcp_chrome"
+    try:
+        webbrowser.register(browser_name, None, webbrowser.BackgroundBrowser(chrome_path))
+    except Exception:
+        return None
+    return browser_name
+
+
+def _accepts_browser_argument(func: Callable[..., Any]) -> bool:
+    try:
+        parameters = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+
+    return "browser" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
+def _run_local_server_with_preferred_browser(
+    flow: Any,
+    browser_open: Callable[..., bool] | None = None,
+) -> Any:
+    run_kwargs: dict[str, Any] = {
+        "port": 0,
+        "open_browser": True,
+        "authorization_prompt_message": None,
+        "success_message": "Authorization complete. You can close this browser tab and return to Claude.",
+    }
+    if browser_open is None:
+        browser_name = _register_chrome_browser()
+        if browser_name and _accepts_browser_argument(flow.run_local_server):
+            run_kwargs["browser"] = browser_name
+            return flow.run_local_server(**run_kwargs)
+
+    original_open = webbrowser.open
+
+    def open_auth_url(url: str, new: int = 0, autoraise: bool = True) -> bool:
+        if browser_open is not None:
+            return bool(browser_open(url, new=new, autoraise=autoraise))
+        return bool(_open_in_chrome_or_default(url, new=new, autoraise=autoraise, fallback_open=original_open))
+
+    webbrowser.open = open_auth_url
+    try:
+        return flow.run_local_server(**run_kwargs)
+    finally:
+        webbrowser.open = original_open
+
+
+def authorize_youtube(
+    base_dir: str | Path | None = None,
+    flow_cls: Any | None = None,
+    browser_open: Callable[..., bool] | None = None,
+) -> tuple[Any | None, dict[str, Any] | None]:
+    """Run the installed-app OAuth flow and persist token.json."""
+    configure_ssl_certificates()
+
+    root = Path(base_dir) if base_dir is not None else BASE_DIR
+    credentials_path = root / "credentials.json"
+    token_path = root / "token.json"
+
+    if not credentials_path.exists():
+        return None, oauth_credentials_missing(credentials_path)
+
+    if flow_cls is None:
+        try:
+            from google_auth_oauthlib.flow import InstalledAppFlow
+        except ImportError:
+            return None, dependency_missing("google-auth-oauthlib")
+
+        flow_cls = InstalledAppFlow
+
+    try:
+        flow = flow_cls.from_client_secrets_file(str(credentials_path), SCOPES)
+        credentials = _run_local_server_with_preferred_browser(flow, browser_open=browser_open)
+        token_path.write_text(credentials.to_json(), encoding="utf-8")
+    except Exception as exc:
+        return None, error_payload(
+            "oauth_failed",
+            message=str(exc),
+            hint="Try running python authorize.py if the browser did not complete sign-in.",
+        )
+
+    return credentials, None
 
 
 def load_config(
@@ -89,29 +281,61 @@ def get_youtube_service(
     credentials_cls: Any | None = None,
     request_factory: Callable[[], Any] | None = None,
     build_func: Callable[..., Any] | None = None,
+    auto_authorize: bool = True,
+    authorize_func: Callable[[str | Path], tuple[Any | None, dict[str, Any] | None]] | None = None,
 ) -> tuple[Any | None, dict[str, Any] | None]:
-    """Build a YouTube API service from a saved token without interactive OAuth."""
+    """Build a YouTube API service, opening browser OAuth when token.json is missing."""
+    configure_ssl_certificates()
+
     root = Path(base_dir) if base_dir is not None else BASE_DIR
     token_path = root / "token.json"
 
-    if not token_path.exists():
-        return None, reauth_required()
+    creds: Any | None = None
+    if token_path.exists():
+        if credentials_cls is None:
+            try:
+                from google.oauth2.credentials import Credentials
+            except ImportError:
+                return None, dependency_missing("google-auth")
 
-    if credentials_cls is None:
+            credentials_cls = Credentials
+
         try:
-            from google.oauth2.credentials import Credentials
-        except ImportError:
-            return None, dependency_missing("google-auth")
+            creds = credentials_cls.from_authorized_user_file(str(token_path), SCOPES)
+        except Exception:
+            creds = None
 
-        credentials_cls = Credentials
-
-    if request_factory is None:
+    if creds is not None and getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
         try:
-            from google.auth.transport.requests import Request
-        except ImportError:
-            return None, dependency_missing("google-auth")
+            if request_factory is None:
+                try:
+                    from google.auth.transport.requests import Request
+                except ImportError:
+                    return None, dependency_missing("google-auth")
 
-        request_factory = Request
+                request_factory = Request
+
+            creds.refresh(request_factory())
+            token_path.write_text(creds.to_json(), encoding="utf-8")
+        except Exception:
+            creds = None
+
+    if creds is None or not getattr(creds, "valid", False):
+        if not auto_authorize:
+            return None, reauth_required()
+
+        if authorize_func is None:
+            creds, auth_error = authorize_youtube(base_dir=root)
+        else:
+            creds, auth_error = authorize_func(root)
+        if auth_error:
+            return None, auth_error
+        if not getattr(creds, "valid", False):
+            return None, error_payload(
+                "oauth_failed",
+                message="authorization did not return valid credentials",
+                hint="Try running python authorize.py.",
+            )
 
     if build_func is None:
         try:
@@ -120,21 +344,6 @@ def get_youtube_service(
             return None, dependency_missing("google-api-python-client")
 
         build_func = build
-
-    try:
-        creds = credentials_cls.from_authorized_user_file(str(token_path), SCOPES)
-    except Exception:
-        return None, reauth_required()
-
-    if getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
-        try:
-            creds.refresh(request_factory())
-            token_path.write_text(creds.to_json(), encoding="utf-8")
-        except Exception:
-            return None, reauth_required()
-
-    if not getattr(creds, "valid", False):
-        return None, reauth_required()
 
     try:
         return build_func("youtube", "v3", credentials=creds), None
