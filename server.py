@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -40,7 +41,46 @@ MAX_TITLE_LENGTH = 100
 MAX_DESCRIPTION_LENGTH = 5000
 MAX_TAGS_TOTAL_LENGTH = 500
 MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024
-
+VALID_LICENSE = {"youtube", "creativeCommon"}
+VIDEO_DETAILS_PARTS = "snippet,status,recordingDetails,contentDetails,statistics"
+CHANGE_FIELD_ORDER = (
+    "title",
+    "description",
+    "tags",
+    "category_id",
+    "default_language",
+    "privacy",
+    "publish_at",
+    "made_for_kids",
+    "contains_synthetic_media",
+    "embeddable",
+    "public_stats_viewable",
+    "license",
+    "recording_date",
+)
+SUPPORTED_CHANGE_FIELDS = set(CHANGE_FIELD_ORDER)
+BOOLEAN_CHANGE_FIELDS = {
+    "made_for_kids",
+    "contains_synthetic_media",
+    "embeddable",
+    "public_stats_viewable",
+}
+FIELD_PARTS = {
+    "title": "snippet",
+    "description": "snippet",
+    "tags": "snippet",
+    "category_id": "snippet",
+    "default_language": "snippet",
+    "privacy": "status",
+    "publish_at": "status",
+    "made_for_kids": "status",
+    "contains_synthetic_media": "status",
+    "embeddable": "status",
+    "public_stats_viewable": "status",
+    "license": "status",
+    "recording_date": "recordingDetails",
+}
+EDIT_PART_ORDER = ("snippet", "status", "recordingDetails")
 
 def _safe_call(func, *args, **kwargs) -> Any:
     try:
@@ -116,15 +156,32 @@ def _best_thumbnail_url(item: dict[str, Any]) -> str:
 def _serialize_video_details(item: dict[str, Any]) -> dict[str, Any]:
     snippet = item.get("snippet", {})
     statistics = item.get("statistics", {})
+    status = item.get("status", {})
+    content_details = item.get("contentDetails", {})
+    recording_details = item.get("recordingDetails", {})
+    description = snippet.get("description", "")
     return {
+        "video_id": item.get("id", ""),
         "title": snippet.get("title", ""),
-        "description": snippet.get("description", ""),
+        "description": description,
+        "description_preview": description[:300],
         "tags": snippet.get("tags") or [],
+        "category_id": str(snippet.get("categoryId", "")),
+        "default_language": snippet.get("defaultLanguage", ""),
+        "privacy": status.get("privacyStatus", ""),
+        "publish_at": status.get("publishAt"),
+        "made_for_kids": status.get("selfDeclaredMadeForKids", status.get("madeForKids")),
+        "contains_synthetic_media": status.get("containsSyntheticMedia"),
+        "embeddable": status.get("embeddable"),
+        "public_stats_viewable": status.get("publicStatsViewable"),
+        "license": status.get("license", ""),
+        "recording_date": recording_details.get("recordingDate"),
+        "duration": content_details.get("duration", ""),
+        "published_at": snippet.get("publishedAt", ""),
         "view_count": _int_value(statistics.get("viewCount")),
         "like_count": _int_value(statistics.get("likeCount")),
         "comment_count": _int_value(statistics.get("commentCount")),
     }
-
 
 def _serialize_competitor(item: dict[str, Any]) -> dict[str, Any]:
     details = _serialize_video_details(item)
@@ -140,6 +197,486 @@ def _serialize_competitor(item: dict[str, Any]) -> dict[str, Any]:
         "comment_count": details["comment_count"],
     }
 
+
+def _serialize_channel_video_summary(item: dict[str, Any]) -> dict[str, Any]:
+    details = _serialize_video_details(item)
+    return {
+        "video_id": details["video_id"],
+        "title": details["title"],
+        "category_id": details["category_id"],
+        "privacy": details["privacy"],
+        "duration": details["duration"],
+        "published_at": details["published_at"],
+        "tags": details["tags"],
+        "description_preview": details["description_preview"],
+    }
+
+
+def _editable_video_state(item: dict[str, Any]) -> dict[str, Any]:
+    details = _serialize_video_details(item)
+    return {field: details.get(field) for field in CHANGE_FIELD_ORDER}
+
+
+def _validate_changes(changes: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not isinstance(changes, dict):
+        return None, yc.error_payload(
+            "validation_error",
+            field="changes",
+            details="changes must be an object",
+        )
+    if not changes:
+        return None, yc.error_payload(
+            "validation_error",
+            field="changes",
+            details="changes must include at least one field",
+        )
+
+    unsupported = sorted(set(changes) - SUPPORTED_CHANGE_FIELDS)
+    if unsupported:
+        return None, yc.error_payload(
+            "validation_error",
+            field="changes",
+            details="unsupported change field",
+            unsupported=unsupported,
+            supported=list(CHANGE_FIELD_ORDER),
+        )
+
+    normalized: dict[str, Any] = {}
+    for field, value in changes.items():
+        if value is None:
+            return None, yc.error_payload(
+                "validation_error",
+                field=field,
+                details=f"{field} cannot be null; omit it to leave unchanged",
+            )
+
+        if field == "title":
+            if not isinstance(value, str):
+                return None, yc.error_payload("validation_error", field=field, details="title must be a string")
+            title = value.strip()
+            if not title:
+                return None, yc.error_payload("validation_error", field=field, details="title is required")
+            if len(title) > MAX_TITLE_LENGTH:
+                return None, yc.error_payload(
+                    "validation_error",
+                    field=field,
+                    details="title must be at most 100 characters",
+                )
+            normalized[field] = title
+        elif field == "description":
+            if not isinstance(value, str):
+                return None, yc.error_payload("validation_error", field=field, details="description must be a string")
+            if len(value) > MAX_DESCRIPTION_LENGTH:
+                return None, yc.error_payload(
+                    "validation_error",
+                    field=field,
+                    details="description must be at most 5000 characters",
+                )
+            normalized[field] = value
+        elif field == "tags":
+            clean_tags, tags_error = _normalize_tags(value)
+            if tags_error:
+                return None, tags_error
+            assert clean_tags is not None
+            normalized[field] = clean_tags
+        elif field == "category_id":
+            category_id = str(value).strip()
+            if not category_id:
+                return None, yc.error_payload("validation_error", field=field, details="category_id is required")
+            normalized[field] = category_id
+        elif field == "default_language":
+            if not isinstance(value, str) or not value.strip():
+                return None, yc.error_payload(
+                    "validation_error",
+                    field=field,
+                    details="default_language must be a non-empty string",
+                )
+            normalized[field] = value.strip()
+        elif field == "privacy":
+            if value not in VALID_PRIVACY:
+                return None, yc.error_payload(
+                    "validation_error",
+                    field=field,
+                    details="privacy must be private, unlisted, or public",
+                )
+            normalized[field] = value
+        elif field in {"publish_at", "recording_date"}:
+            if not isinstance(value, str) or not value.strip() or not _validate_iso8601(value):
+                return None, yc.error_payload(
+                    "validation_error",
+                    field=field,
+                    details=f"{field} must be ISO 8601",
+                )
+            normalized[field] = value
+        elif field in BOOLEAN_CHANGE_FIELDS:
+            if not isinstance(value, bool):
+                return None, yc.error_payload("validation_error", field=field, details=f"{field} must be boolean")
+            normalized[field] = value
+        elif field == "license":
+            if value not in VALID_LICENSE:
+                return None, yc.error_payload(
+                    "validation_error",
+                    field=field,
+                    details="license must be youtube or creativeCommon",
+                )
+            normalized[field] = value
+
+    return normalized, None
+
+
+def _fetch_video_item(
+    service: Any,
+    video_id: str,
+    parts: str = VIDEO_DETAILS_PARTS,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    try:
+        response = _execute(service.videos().list(part=parts, id=video_id))
+    except Exception as exc:
+        return None, yc.normalize_http_error(exc)
+
+    items = response.get("items", [])
+    if not items:
+        return None, yc.error_payload("video_not_found", video_id=video_id)
+    return items[0], None
+
+
+def _mutable_snippet_body(snippet: dict[str, Any]) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "title": snippet.get("title", ""),
+        "description": snippet.get("description", ""),
+        "tags": snippet.get("tags") or [],
+        "categoryId": str(snippet.get("categoryId", "22")),
+    }
+    for field in ("defaultLanguage", "defaultAudioLanguage"):
+        if snippet.get(field):
+            body[field] = snippet[field]
+    return body
+
+
+def _mutable_status_body(status: dict[str, Any]) -> dict[str, Any]:
+    body: dict[str, Any] = {}
+    for field in (
+        "privacyStatus",
+        "publishAt",
+        "selfDeclaredMadeForKids",
+        "containsSyntheticMedia",
+        "embeddable",
+        "publicStatsViewable",
+        "license",
+    ):
+        if field in status:
+            body[field] = status[field]
+    return body
+
+
+def _mutable_recording_details_body(recording_details: dict[str, Any]) -> dict[str, Any]:
+    body: dict[str, Any] = {}
+    for field in ("recordingDate", "locationDescription", "location"):
+        if field in recording_details:
+            body[field] = recording_details[field]
+    return body
+
+
+def _build_edit_body(
+    item: dict[str, Any],
+    changes: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], list[str], dict[str, Any] | None]:
+    after_item = deepcopy(item)
+    snippet = after_item.setdefault("snippet", {})
+    status = after_item.setdefault("status", {})
+    recording_details = after_item.setdefault("recordingDetails", {})
+
+    if "title" in changes:
+        snippet["title"] = changes["title"]
+    if "description" in changes:
+        snippet["description"] = changes["description"]
+    if "tags" in changes:
+        snippet["tags"] = changes["tags"]
+    if "category_id" in changes:
+        snippet["categoryId"] = changes["category_id"]
+    if "default_language" in changes:
+        snippet["defaultLanguage"] = changes["default_language"]
+    if "privacy" in changes:
+        status["privacyStatus"] = changes["privacy"]
+    if "publish_at" in changes:
+        status["publishAt"] = changes["publish_at"]
+    if "made_for_kids" in changes:
+        status["selfDeclaredMadeForKids"] = changes["made_for_kids"]
+    if "contains_synthetic_media" in changes:
+        status["containsSyntheticMedia"] = changes["contains_synthetic_media"]
+    if "embeddable" in changes:
+        status["embeddable"] = changes["embeddable"]
+    if "public_stats_viewable" in changes:
+        status["publicStatsViewable"] = changes["public_stats_viewable"]
+    if "license" in changes:
+        status["license"] = changes["license"]
+    if "recording_date" in changes:
+        recording_details["recordingDate"] = changes["recording_date"]
+
+    after_state = _editable_video_state(after_item)
+    if "publish_at" in changes and after_state.get("privacy") != "private":
+        return {}, after_item, [], yc.error_payload(
+            "validation_error",
+            field="publish_at",
+            details="publish_at requires effective privacy to be private",
+        )
+
+    before_state = _editable_video_state(item)
+    changed_fields = [
+        field
+        for field in CHANGE_FIELD_ORDER
+        if field in changes and before_state.get(field) != after_state.get(field)
+    ]
+    changed_parts = {FIELD_PARTS[field] for field in changed_fields}
+
+    body: dict[str, Any] = {"id": item.get("id", "")}
+    if "snippet" in changed_parts:
+        body["snippet"] = _mutable_snippet_body(after_item.get("snippet", {}))
+    if "status" in changed_parts:
+        body["status"] = _mutable_status_body(after_item.get("status", {}))
+    if "recordingDetails" in changed_parts:
+        body["recordingDetails"] = _mutable_recording_details_body(after_item.get("recordingDetails", {}))
+
+    parts = [part for part in EDIT_PART_ORDER if part in changed_parts]
+    body["_parts"] = parts
+    return body, after_item, changed_fields, None
+
+
+def _edit_video(
+    video_id: str,
+    changes: Any,
+    dry_run: bool = False,
+    youtube: Any | None = None,
+) -> dict[str, Any]:
+    if not isinstance(video_id, str) or not video_id.strip():
+        return yc.error_payload("validation_error", field="video_id", details="video_id is required")
+    clean_video_id = video_id.strip()
+
+    normalized_changes, changes_error = _validate_changes(changes)
+    if changes_error:
+        return changes_error
+    assert normalized_changes is not None
+
+    service, service_error = _service_or_error(youtube)
+    if service_error:
+        return service_error
+
+    item, fetch_error = _fetch_video_item(service, clean_video_id)
+    if fetch_error:
+        return fetch_error
+    assert item is not None
+
+    body, after_item, changed_fields, build_error = _build_edit_body(item, normalized_changes)
+    if build_error:
+        return build_error
+
+    result = {
+        "video_id": clean_video_id,
+        "dry_run": bool(dry_run),
+        "updated": False,
+        "changed_fields": changed_fields,
+        "before": _editable_video_state(item),
+        "after": _editable_video_state(after_item),
+    }
+    if not changed_fields or dry_run:
+        return result
+
+    parts = body.pop("_parts")
+    try:
+        response = _execute(service.videos().update(part=",".join(parts), body=body))
+    except Exception as exc:
+        return yc.normalize_http_error(exc)
+
+    result["updated"] = True
+    if isinstance(response, dict) and response.get("id"):
+        confirmed_item = deepcopy(after_item)
+        for part in ("snippet", "status", "recordingDetails"):
+            if part in response:
+                confirmed_item[part] = response[part]
+        result["after"] = _editable_video_state(confirmed_item)
+    return result
+
+
+def _normalize_video_ids(video_ids: Any) -> tuple[list[str] | None, dict[str, Any] | None]:
+    if not isinstance(video_ids, list) or not video_ids:
+        return None, yc.error_payload(
+            "validation_error",
+            field="video_ids",
+            details="video_ids must be a non-empty list",
+        )
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in video_ids:
+        if not isinstance(value, str) or not value.strip():
+            return None, yc.error_payload(
+                "validation_error",
+                field="video_ids",
+                details="each video_id must be a non-empty string",
+            )
+        clean = value.strip()
+        if clean not in seen:
+            seen.add(clean)
+            normalized.append(clean)
+    return normalized, None
+
+
+def _bulk_edit_videos(
+    video_ids: list[str] | None = None,
+    changes: Any | None = None,
+    edits: list[dict[str, Any]] | None = None,
+    dry_run: bool = True,
+    youtube: Any | None = None,
+) -> dict[str, Any]:
+    same_change_mode = video_ids is not None or changes is not None
+    per_video_mode = edits is not None
+    if same_change_mode == per_video_mode:
+        return yc.error_payload(
+            "validation_error",
+            field="bulk_edit_videos",
+            details="use exactly one mode: video_ids plus changes, or edits",
+        )
+
+    batch: list[dict[str, Any]] = []
+    if same_change_mode:
+        if video_ids is None or changes is None:
+            return yc.error_payload(
+                "validation_error",
+                field="bulk_edit_videos",
+                details="same-change mode requires video_ids and changes",
+            )
+        clean_ids, ids_error = _normalize_video_ids(video_ids)
+        if ids_error:
+            return ids_error
+        assert clean_ids is not None
+        _, changes_error = _validate_changes(changes)
+        if changes_error:
+            return changes_error
+        batch = [{"video_id": video_id, "changes": changes} for video_id in clean_ids]
+    else:
+        if not isinstance(edits, list) or not edits:
+            return yc.error_payload(
+                "validation_error",
+                field="edits",
+                details="edits must be a non-empty list",
+            )
+        seen: set[str] = set()
+        for index, edit in enumerate(edits):
+            if not isinstance(edit, dict):
+                return yc.error_payload("validation_error", field="edits", details="each edit must be an object")
+            video_id = edit.get("video_id")
+            if not isinstance(video_id, str) or not video_id.strip():
+                return yc.error_payload(
+                    "validation_error",
+                    field="video_id",
+                    details=f"edits[{index}].video_id is required",
+                )
+            clean_video_id = video_id.strip()
+            if clean_video_id in seen:
+                return yc.error_payload(
+                    "validation_error",
+                    field="video_id",
+                    details="duplicate video_id in per-video edits",
+                    video_id=clean_video_id,
+                )
+            seen.add(clean_video_id)
+            _, changes_error = _validate_changes(edit.get("changes"))
+            if changes_error:
+                return changes_error
+            batch.append({"video_id": clean_video_id, "changes": edit.get("changes")})
+
+    service, service_error = _service_or_error(youtube)
+    if service_error:
+        return service_error
+
+    results: list[dict[str, Any]] = []
+    for edit in batch:
+        result = _edit_video(edit["video_id"], edit["changes"], dry_run=dry_run, youtube=service)
+        if isinstance(result, dict) and "error" in result and "video_id" not in result:
+            result = {"video_id": edit["video_id"], **result}
+        results.append(result)
+
+    return {
+        "dry_run": bool(dry_run),
+        "total": len(results),
+        "updated": sum(1 for result in results if result.get("updated") is True),
+        "results": results,
+    }
+
+
+def _list_channel_videos(
+    max_results: int = 50,
+    page_token: str | None = None,
+    youtube: Any | None = None,
+) -> dict[str, Any]:
+    try:
+        limit = int(max_results)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 50))
+
+    service, service_error = _service_or_error(youtube)
+    if service_error:
+        return service_error
+
+    try:
+        channel_response = _execute(service.channels().list(part="contentDetails", mine=True))
+    except Exception as exc:
+        return yc.normalize_http_error(exc)
+
+    channel_items = channel_response.get("items", [])
+    if not channel_items:
+        return yc.error_payload("channel_not_found")
+
+    uploads_playlist_id = (
+        channel_items[0]
+        .get("contentDetails", {})
+        .get("relatedPlaylists", {})
+        .get("uploads")
+    )
+    if not uploads_playlist_id:
+        return yc.error_payload("channel_uploads_not_found")
+
+    playlist_kwargs: dict[str, Any] = {
+        "part": "contentDetails",
+        "playlistId": uploads_playlist_id,
+        "maxResults": limit,
+    }
+    if page_token:
+        playlist_kwargs["pageToken"] = page_token
+
+    try:
+        playlist_response = _execute(service.playlistItems().list(**playlist_kwargs))
+    except Exception as exc:
+        return yc.normalize_http_error(exc)
+
+    video_ids = [
+        item.get("contentDetails", {}).get("videoId")
+        for item in playlist_response.get("items", [])
+        if item.get("contentDetails", {}).get("videoId")
+    ]
+    if not video_ids:
+        return {
+            "videos": [],
+            "next_page_token": playlist_response.get("nextPageToken"),
+        }
+
+    try:
+        details_response = _execute(
+            service.videos().list(part="snippet,status,contentDetails", id=",".join(video_ids))
+        )
+    except Exception as exc:
+        return yc.normalize_http_error(exc)
+
+    videos_by_id = {item.get("id"): item for item in details_response.get("items", [])}
+    return {
+        "videos": [
+            _serialize_channel_video_summary(videos_by_id[video_id])
+            for video_id in video_ids
+            if video_id in videos_by_id
+        ],
+        "next_page_token": playlist_response.get("nextPageToken"),
+    }
 
 def _list_pending_files(config_path: str | Path | None = None) -> dict[str, Any]:
     config, config_error = _load_config(config_path)
@@ -239,17 +776,12 @@ def _get_video_details(video_id: str, youtube: Any | None = None) -> dict[str, A
     if service_error:
         return service_error
 
-    try:
-        response = _execute(service.videos().list(part="snippet,statistics", id=video_id))
-    except Exception as exc:
-        return yc.normalize_http_error(exc)
+    item, fetch_error = _fetch_video_item(service, video_id.strip())
+    if fetch_error:
+        return fetch_error
+    assert item is not None
 
-    items = response.get("items", [])
-    if not items:
-        return yc.error_payload("video_not_found", video_id=video_id)
-
-    return _serialize_video_details(items[0])
-
+    return _serialize_video_details(item)
 
 def _get_channel_info(youtube: Any | None = None) -> dict[str, Any]:
     service, service_error = _service_or_error(youtube)
@@ -421,7 +953,7 @@ def _upload_video(
             "description": final_description,
             "tags": clean_tags,
             "categoryId": str(config.get("default_category_id", "22")),
-            "defaultLanguage": str(config.get("default_language", "ru")),
+            "defaultLanguage": str(config.get("default_language", "en")),
         },
         "status": status_body,
     }
@@ -493,9 +1025,31 @@ def search_competitors(query: str, max_results: int = 10) -> Any:
 
 @mcp.tool()
 def get_video_details(video_id: str) -> Any:
-    """Get title, description, tags, and statistics for one YouTube video."""
+    """Get editable metadata, status, content details, and statistics for one video."""
     return _safe_call(_get_video_details, video_id)
 
+
+@mcp.tool()
+def list_channel_videos(max_results: int = 50, page_token: str | None = None) -> Any:
+    """List uploaded channel videos with metadata useful for selecting edit targets."""
+    return _safe_call(_list_channel_videos, max_results, page_token)
+
+
+@mcp.tool()
+def edit_video(video_id: str, changes: dict[str, Any], dry_run: bool = False) -> Any:
+    """Edit mutable metadata and status fields for one existing YouTube video."""
+    return _safe_call(_edit_video, video_id, changes, dry_run)
+
+
+@mcp.tool()
+def bulk_edit_videos(
+    video_ids: list[str] | None = None,
+    changes: dict[str, Any] | None = None,
+    edits: list[dict[str, Any]] | None = None,
+    dry_run: bool = True,
+) -> Any:
+    """Edit existing YouTube videos by explicit IDs, defaulting to dry-run."""
+    return _safe_call(_bulk_edit_videos, video_ids, changes, edits, dry_run)
 
 @mcp.tool()
 def upload_video(

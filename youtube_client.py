@@ -16,8 +16,8 @@ SCOPES = [
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "footer_template": "",
-    "default_category_id": "22", // "Education" category id
-    "default_language": "en", // "English" language code
+    "default_category_id": "22",
+    "default_language": "en",
     "default_privacy": "private",
     "made_for_kids": False,
 }

@@ -3,14 +3,18 @@
 Local Python MCP server for automating YouTube uploads through YouTube Data API v3.
 
 The server exposes tools for listing queued media, competitor research, video details,
-channel verification, uploads, and custom thumbnails. OAuth browser login is handled
-only by `authorize.py`; the MCP stdio server never opens a browser.
+channel verification, uploads, custom thumbnails, and editing existing channel videos.
+OAuth browser login is handled only by `authorize.py`; the MCP stdio server never opens
+a browser.
 
 ## Tools
 
 - `list_pending_files()`
 - `search_competitors(query, max_results=10)`
+- `list_channel_videos(max_results=50, page_token=None)`
 - `get_video_details(video_id)`
+- `edit_video(video_id, changes, dry_run=False)`
+- `bulk_edit_videos(video_ids=None, changes=None, edits=None, dry_run=True)`
 - `upload_video(video_path, title, description, tags, thumbnail_path=None, scheduled_time=None, privacy=None)`
 - `set_thumbnail(video_id, image_path)`
 - `get_channel_info()`
@@ -24,12 +28,21 @@ only by `authorize.py`; the MCP stdio server never opens a browser.
 
 ## 2. OAuth Consent Screen
 
-1. Go to APIs & Services > OAuth consent screen.
-2. Choose External, then Create.
-3. Fill the required app name and email fields.
-4. You can skip adding scopes on the consent-screen wizard.
-5. Add your Google account under Test users. Use the account that owns or manages the YouTube channel.
-6. Save the app in Testing mode. That is fine for personal/local use.
+Google now shows this as **Google Auth Platform**, so you might not see the old
+single-page "External" menu.
+
+1. Go to Google Auth Platform > Overview.
+2. If you see "Google Auth Platform not configured yet", click **Get started**.
+3. Under App information, enter an app name such as `YouTube Automation`.
+4. Choose your user support email, then click **Next**.
+5. Under Audience, choose **External** as the user type, then click **Next**.
+   - If your project is not inside a Google Workspace organization, External may be the only practical option.
+   - If you do not see External before clicking Get started, that is expected in the new UI.
+6. Under Contact information, enter your email, then click **Next**.
+7. Accept the Google API Services User Data Policy, then click **Continue** and **Create**.
+8. Open Google Auth Platform > Audience.
+9. Under Test users, click **Add users** and add your Google account. Use the account that owns or manages the YouTube channel.
+10. Keep the app in Testing mode for personal/local use.
 
 Without the test user entry, Google may return `access_denied` during authorization.
 
@@ -45,7 +58,7 @@ Without the test user entry, Google may return `access_denied` during authorizat
 ## 4. Install
 
 ```bash
-cd youtube_mcp
+cd youtube-upload-mcp
 pip install -r requirements.txt
 ```
 
@@ -101,6 +114,56 @@ On Windows, if `python` is not found, use the full path to `python.exe` or use `
 3. Put a test video in `videos_dir`.
 4. Call `list_pending_files`.
 5. Upload only a private test video first.
+
+## Editing Existing Videos
+
+Use `list_channel_videos` to inspect uploaded videos and choose explicit `video_id`
+targets. The MCP does not auto-filter Shorts or any other video type; the LLM/client
+chooses what to edit.
+
+`edit_video` and `bulk_edit_videos` accept these `changes` keys:
+
+- `title`, `description`, `tags`, `category_id`, `default_language`
+- `privacy`, `publish_at`, `made_for_kids`, `contains_synthetic_media`
+- `embeddable`, `public_stats_viewable`, `license`, `recording_date`
+
+Omit fields to leave them unchanged. Use `description: ""` or `tags: []` to clear
+those values. `null` values are rejected to avoid accidental metadata deletion.
+
+Single-video edits execute by default:
+
+```json
+{
+  "video_id": "VIDEO_ID",
+  "changes": {
+    "title": "New title",
+    "category_id": "27",
+    "privacy": "unlisted"
+  }
+}
+```
+
+Bulk edits target explicit IDs only and default to `dry_run: true`:
+
+```json
+{
+  "video_ids": ["VIDEO_ID_1", "VIDEO_ID_2"],
+  "changes": {"category_id": "27"},
+  "dry_run": true
+}
+```
+
+For different edits per video, use `edits`:
+
+```json
+{
+  "edits": [
+    {"video_id": "VIDEO_ID_1", "changes": {"title": "First title"}},
+    {"video_id": "VIDEO_ID_2", "changes": {"privacy": "private"}}
+  ],
+  "dry_run": false
+}
+```
 
 ## Scheduling
 

@@ -33,7 +33,7 @@ class ConfigAndFileTests(unittest.TestCase):
 
             self.assertIsNone(err)
             self.assertEqual(config["default_category_id"], "22")
-            self.assertEqual(config["default_language"], "ru")
+            self.assertEqual(config["default_language"], "en")
             self.assertEqual(config["default_privacy"], "private")
             self.assertFalse(config["made_for_kids"])
 
