@@ -1,0 +1,9 @@
+{
+  "videos_dir": "E:/YouTube/queue/videos",
+  "thumbs_dir": "E:/YouTube/queue/thumbs",
+  "footer_template": "\n\n---\nInstagram: https://...\nPortfolio: https://...\nTikTok: https://...",
+  "default_category_id": "22",
+  "default_language": "ru",
+  "default_privacy": "private",
+  "made_for_kids": false
+}

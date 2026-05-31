@@ -1,0 +1,9 @@
+token.json
+credentials.json
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+__pycache__/
+.pytest_cache/
