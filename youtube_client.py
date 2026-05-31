@@ -36,6 +36,71 @@ QUOTA_REASONS = {
 
 CERTIFICATE_ENV_VARS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "HTTPLIB2_CA_CERTS")
 
+# Hosts a TLS-interception proxy (corporate proxy / antivirus) would sit in front of.
+TLS_PROBE_HOST = "www.googleapis.com"
+
+# Known consumer antivirus products that ship a non-standard root CA for HTTPS scanning.
+# Maps a marker found in the intercepting certificate's issuer to a human-readable name
+# and the in-app steps to disable HTTPS scanning.
+INTERCEPTOR_HINTS = {
+    "AVG": "AVG Antivirus",
+    "Avast": "Avast Antivirus",
+    "Kaspersky": "Kaspersky",
+    "ESET": "ESET",
+    "Bitdefender": "Bitdefender",
+    "Dr.Web": "Dr.Web",
+    "Fortinet": "Fortinet/FortiClient",
+    "Sophos": "Sophos",
+}
+
+# Set once truststore has switched Python over to the operating-system trust store.
+_OS_TRUST_ENABLED = False
+
+
+def os_trust_enabled() -> bool:
+    """Return True once :func:`enable_os_trust_store` has handed TLS verification to the OS."""
+    return _OS_TRUST_ENABLED
+
+
+def set_os_trust_enabled(enabled: bool) -> None:
+    """Force the OS-trust flag on or off (escape hatch for advanced callers and tests)."""
+    global _OS_TRUST_ENABLED
+    _OS_TRUST_ENABLED = enabled
+
+
+def enable_os_trust_store(injector: Callable[[], None] | None = None) -> dict[str, Any]:
+    """Route Python's TLS verification through the operating-system trust store.
+
+    This is the universal fix for "unable to get local issuer certificate": when an
+    antivirus or corporate proxy intercepts HTTPS, its root CA already lives in the OS
+    trust store, so the OS verifier accepts the chain that certifi cannot. Safe no-op
+    when truststore is not installed -- callers fall back to the certifi bundle.
+    """
+    global _OS_TRUST_ENABLED
+
+    if _OS_TRUST_ENABLED:
+        return {"configured": True, "source": "os_trust_store", "already": True}
+
+    if injector is None:
+        try:
+            import truststore
+        except ImportError:
+            return {
+                "configured": False,
+                "reason": "truststore_missing",
+                "hint": "run: pip install -r requirements.txt",
+            }
+
+        injector = truststore.inject_into_ssl
+
+    try:
+        injector()
+    except Exception as exc:
+        return {"configured": False, "reason": "truststore_failed", "message": str(exc)}
+
+    _OS_TRUST_ENABLED = True
+    return {"configured": True, "source": "os_trust_store"}
+
 
 def error_payload(code: str, **fields: Any) -> dict[str, Any]:
     payload = {"error": code}
@@ -93,8 +158,18 @@ def get_certifi_bundle_path(
 
 def configure_ssl_certificates(
     certifi_where: Callable[[], str] | None = None,
+    injector: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    """Point Google HTTP stacks at a reliable CA bundle when one is not configured."""
+    """Prepare TLS verification before any Google API call.
+
+    Preferred path: hand verification to the OS trust store via truststore, which
+    transparently handles antivirus/proxy interception. The certifi bundle is still
+    configured as a fallback for environments where truststore is unavailable.
+    """
+    os_trust = enable_os_trust_store(injector=injector)
+    if os_trust.get("configured"):
+        return os_trust
+
     bundle_path = next((os.environ[name] for name in CERTIFICATE_ENV_VARS if os.environ.get(name)), None)
     source = "environment" if bundle_path else "certifi"
 
@@ -119,12 +194,23 @@ def build_certified_refresh_request(
     request_cls: Any | None = None,
     session_factory: Callable[[], Any] | None = None,
     certifi_where: Callable[[], str] | None = None,
+    os_trust: bool | None = None,
 ) -> tuple[Any | None, dict[str, Any] | None]:
-    """Create a google-auth Requests transport pinned to certifi's CA bundle."""
-    bundle_path, bundle_error = get_certifi_bundle_path(certifi_where)
-    if bundle_error:
-        return None, bundle_error
-    assert bundle_path is not None
+    """Create a google-auth Requests transport for refreshing credentials.
+
+    When the OS trust store is active the session is left at its default verification
+    (which truststore has already routed through the OS); otherwise it is pinned to
+    certifi's CA bundle.
+    """
+    if os_trust is None:
+        os_trust = os_trust_enabled()
+
+    bundle_path: str | None = None
+    if not os_trust:
+        bundle_path, bundle_error = get_certifi_bundle_path(certifi_where)
+        if bundle_error:
+            return None, bundle_error
+        assert bundle_path is not None
 
     if request_cls is None:
         try:
@@ -143,7 +229,8 @@ def build_certified_refresh_request(
         session_factory = requests.Session
 
     session = session_factory()
-    session.verify = bundle_path
+    if bundle_path is not None:
+        session.verify = bundle_path
     return request_cls(session=session), None
 
 
@@ -152,12 +239,23 @@ def build_authorized_http(
     http_cls: Any | None = None,
     authorized_http_cls: Any | None = None,
     certifi_where: Callable[[], str] | None = None,
+    os_trust: bool | None = None,
 ) -> tuple[Any | None, dict[str, Any] | None]:
-    """Create an AuthorizedHttp for googleapiclient using certifi for TLS verification."""
-    bundle_path, bundle_error = get_certifi_bundle_path(certifi_where)
-    if bundle_error:
-        return None, bundle_error
-    assert bundle_path is not None
+    """Create an AuthorizedHttp for googleapiclient.
+
+    When the OS trust store is active, httplib2 is left to build its default SSL
+    context (routed through the OS by truststore); otherwise TLS is verified against
+    certifi's CA bundle.
+    """
+    if os_trust is None:
+        os_trust = os_trust_enabled()
+
+    bundle_path: str | None = None
+    if not os_trust:
+        bundle_path, bundle_error = get_certifi_bundle_path(certifi_where)
+        if bundle_error:
+            return None, bundle_error
+        assert bundle_path is not None
 
     if http_cls is None:
         try:
@@ -175,8 +273,89 @@ def build_authorized_http(
 
         authorized_http_cls = AuthorizedHttp
 
-    http = http_cls(ca_certs=bundle_path)
+    http = http_cls() if bundle_path is None else http_cls(ca_certs=bundle_path)
+    # Resumable uploads (YouTube, Drive) answer each chunk with "308 Resume
+    # Incomplete", which carries a Range header but no Location. httplib2 >= 0.20
+    # lists 308 in its redirect codes and would raise RedirectMissingLocation
+    # ("Redirected but the response is missing a Location: header.") before
+    # googleapiclient can read the 308. Drop 308 from this transport's redirect
+    # codes, mirroring googleapiclient.http.build_http(), which this code bypasses
+    # by constructing httplib2.Http directly.
+    try:
+        http.redirect_codes = http.redirect_codes - {308}
+    except (AttributeError, TypeError):
+        # Older httplib2 lacks redirect_codes; injected test doubles may omit it.
+        pass
     return authorized_http_cls(credentials, http=http), None
+
+
+def is_certificate_verify_error(exc: Exception) -> bool:
+    """True when ``exc`` (or its cause/context) is a TLS certificate-verification failure."""
+    import ssl
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return True
+        text = str(current).upper()
+        if "CERTIFICATE_VERIFY_FAILED" in text or "CERTIFICATE VERIFY FAILED" in text:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _load_peer_certificate_der(host: str) -> bytes | None:
+    """Fetch the leaf certificate the network actually presents for ``host`` (unverified)."""
+    import socket
+    import ssl
+
+    ctx = ssl._create_unverified_context()
+    try:
+        with socket.create_connection((host, 443), timeout=5) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as tls:
+                return tls.getpeercert(binary_form=True)
+    except Exception:
+        return None
+
+
+def diagnose_tls_interception(
+    host: str = TLS_PROBE_HOST,
+    der_loader: Callable[[str], bytes | None] | None = None,
+) -> dict[str, Any] | None:
+    """Identify a TLS-intercepting antivirus/proxy by inspecting the presented certificate.
+
+    Returns a human-readable hint payload when interception is detected, otherwise None.
+    Detection-only: it reads the issuer markers embedded in the certificate and never
+    trusts it.
+    """
+    loader = der_loader or _load_peer_certificate_der
+    der = loader(host)
+    if not der:
+        return None
+
+    # Issuer organisation/common-name strings are embedded as printable text in the DER,
+    # so a substring scan reliably identifies the interceptor without extra dependencies.
+    text = der.decode("latin-1", errors="ignore")
+    product = next((name for marker, name in INTERCEPTOR_HINTS.items() if marker in text), None)
+    if product is None:
+        return None
+
+    return {
+        "interceptor": product,
+        "message": (
+            f"Your HTTPS traffic to Google is being intercepted by {product}, "
+            "and its security certificate is not trusted by this connection."
+        ),
+        "hint": (
+            f"Open {product} and turn off HTTPS / SSL scanning (often called "
+            "\"Web Shield\" or \"Encrypted connection scanning\"), or add "
+            "*.googleapis.com and *.youtube.com to its exclusions, then try again. "
+            "Reinstalling truststore (pip install -r requirements.txt) also resolves this "
+            "automatically on most systems."
+        ),
+    }
 
 
 def _find_chrome_executable() -> str | None:
@@ -435,6 +614,23 @@ def get_youtube_service(
 
 def normalize_http_error(exc: Exception, context: str | None = None) -> dict[str, Any]:
     """Map Google API errors into stable MCP-friendly payloads."""
+    if is_certificate_verify_error(exc):
+        diagnosis = diagnose_tls_interception()
+        payload = error_payload(
+            "tls_interception" if diagnosis else "tls_verification_failed",
+            message=(diagnosis or {}).get("message", str(exc)),
+            hint=(diagnosis or {}).get(
+                "hint",
+                "A proxy or antivirus is blocking the secure connection to Google. "
+                "Disable HTTPS/SSL scanning or install truststore (pip install -r requirements.txt).",
+            ),
+        )
+        if diagnosis:
+            payload["interceptor"] = diagnosis["interceptor"]
+        if context:
+            payload["context"] = context
+        return payload
+
     status = getattr(getattr(exc, "resp", None), "status", None)
     reason: str | None = None
     message = str(exc)

@@ -63,10 +63,18 @@ cd youtube-upload-mcp
 pip install -r requirements.txt
 ```
 
-The server installs `certifi`, automatically points Python, Requests, and httplib2 at
-that CA bundle when no certificate bundle is already configured, and explicitly passes
-the certifi bundle to Google token refresh and YouTube Data API transports. You
+On startup the server routes TLS verification through the operating-system trust store
+via `truststore`. This transparently handles HTTPS interception by antivirus software
+(AVG, Avast, Kaspersky, ESET, Bitdefender, …) and corporate proxies, whose root
+certificate already lives in the OS store but is rejected by the bundled `certifi`
+list — the usual cause of `CERTIFICATE_VERIFY_FAILED: unable to get local issuer
+certificate`. When `truststore` is unavailable, it falls back to the `certifi` bundle
+for Python, Requests, httplib2, token refresh, and the YouTube Data API transport. You
 normally do not need to set `SSL_CERT_FILE` manually.
+
+If a certificate error still occurs, the affected tool returns a plain-language message
+naming the intercepting product and how to fix it (disable its HTTPS/SSL scanning, e.g.
+AVG's "Web Shield", or add `*.googleapis.com` and `*.youtube.com` to its exclusions).
 
 ## 5. Authorize
 

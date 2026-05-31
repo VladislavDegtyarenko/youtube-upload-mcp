@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-05-31 - Fix resumable upload 308 handling
+
+- Fixed `upload_video` failing with `youtube_api_error: "Redirected but the response is missing a Location: header."`. Resumable uploads answer each chunk with `308 Resume Incomplete` (a `Range` header, no `Location`), but httplib2 >= 0.20 lists 308 among its redirect codes and raised `RedirectMissingLocation` before googleapiclient could read it.
+- `build_authorized_http` now removes 308 from the httplib2 transport's `redirect_codes`, mirroring `googleapiclient.http.build_http()`, which this server bypasses by constructing `httplib2.Http` directly. The guard is a no-op on older httplib2 and on injected test doubles.
+
+## 2026-05-31 - OS trust store and TLS interception guidance
+
+- Routed TLS verification through the operating-system trust store via `truststore` at server startup, transparently fixing `CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate` caused by antivirus/proxy HTTPS interception (e.g. AVG Web Shield) whose root CA the bundled `certifi` list cannot accept.
+- Kept `certifi` as an automatic fallback: `build_authorized_http` and `build_certified_refresh_request` skip certifi pinning when the OS trust store is active and pin it otherwise.
+- Added a friendly diagnosis: certificate-verification errors now return a plain-language payload (`tls_interception`) naming the intercepting product and the steps to disable its HTTPS scanning, instead of a raw SSL stack trace.
+- Added tests for OS-trust enablement, the certifi fallback path, interceptor diagnosis, and the error mapping.
+
 ## 2026-05-31 - Explicit certifi transport verification
 
 - Pinned OAuth token refresh requests to `certifi` via `requests.Session.verify`.

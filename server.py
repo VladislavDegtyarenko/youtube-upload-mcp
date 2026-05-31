@@ -31,6 +31,10 @@ try:
 except ImportError:
     import youtube_client as yc  # type: ignore[no-redef]
 
+# Route TLS verification through the OS trust store as early as possible so that
+# antivirus/proxy HTTPS interception is handled transparently for every API call.
+yc.enable_os_trust_store()
+
 mcp = FastMCP("youtube-automation")
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
