@@ -63,9 +63,10 @@ cd youtube-upload-mcp
 pip install -r requirements.txt
 ```
 
-The server installs `certifi` and automatically points Python, Requests, and
-httplib2 at that CA bundle when no certificate bundle is already configured.
-You normally do not need to set `SSL_CERT_FILE` manually.
+The server installs `certifi`, automatically points Python, Requests, and httplib2 at
+that CA bundle when no certificate bundle is already configured, and explicitly passes
+the certifi bundle to Google token refresh and YouTube Data API transports. You
+normally do not need to set `SSL_CERT_FILE` manually.
 
 ## 5. Authorize
 

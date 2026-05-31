@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-05-31 - Explicit certifi transport verification
+
+- Pinned OAuth token refresh requests to `certifi` via `requests.Session.verify`.
+- Built the YouTube Data API client with `httplib2.Http(ca_certs=certifi.where())`, so channel listing, edits, uploads, and thumbnail calls no longer depend on a broken local CA store.
+
 ## 2026-05-31 - Automatic MCP OAuth startup
 
 - Added automatic browser OAuth from MCP when `token.json` is missing or invalid, so users do not need to run `python authorize.py` before the first authenticated tool call.

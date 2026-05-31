@@ -56,6 +56,27 @@ class FakeFlow:
         return FakeCredentials.instance
 
 
+class FakeSession:
+    def __init__(self):
+        self.verify: str | None = None
+
+
+class FakeRefreshRequest:
+    def __init__(self, session: FakeSession):
+        self.session = session
+
+
+class FakeHttp:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class FakeAuthorizedHttp:
+    def __init__(self, credentials: FakeCredentials, http: FakeHttp):
+        self.credentials = credentials
+        self.http = http
+
+
 class YouTubeClientTests(unittest.TestCase):
     def test_configure_ssl_certificates_uses_certifi_when_env_is_missing(self) -> None:
         with patch.dict(yc.os.environ, {}, clear=True):
@@ -74,6 +95,32 @@ class YouTubeClientTests(unittest.TestCase):
             self.assertEqual(result["source"], "environment")
             for name in yc.CERTIFICATE_ENV_VARS:
                 self.assertEqual(yc.os.environ[name], "D:/custom-ca.pem")
+
+    def test_build_certified_refresh_request_sets_requests_verify(self) -> None:
+        request, err = yc.build_certified_refresh_request(
+            request_cls=FakeRefreshRequest,
+            session_factory=FakeSession,
+            certifi_where=lambda: "C:/certifi/cacert.pem",
+        )
+
+        self.assertIsNone(err)
+        self.assertIsInstance(request, FakeRefreshRequest)
+        self.assertEqual(request.session.verify, "C:/certifi/cacert.pem")
+
+    def test_build_authorized_http_sets_httplib2_ca_certs(self) -> None:
+        credentials = FakeCredentials(valid=True, expired=False)
+
+        authorized_http, err = yc.build_authorized_http(
+            credentials,
+            http_cls=FakeHttp,
+            authorized_http_cls=FakeAuthorizedHttp,
+            certifi_where=lambda: "C:/certifi/cacert.pem",
+        )
+
+        self.assertIsNone(err)
+        self.assertIsInstance(authorized_http, FakeAuthorizedHttp)
+        self.assertIs(authorized_http.credentials, credentials)
+        self.assertEqual(authorized_http.http.kwargs["ca_certs"], "C:/certifi/cacert.pem")
 
     def test_missing_token_returns_reauth_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -123,6 +170,29 @@ class YouTubeClientTests(unittest.TestCase):
             self.assertEqual(authorize_calls, [root])
             self.assertEqual(service["service_name"], "youtube")
             self.assertIs(service["credentials"], FakeCredentials.instance)
+
+    def test_get_youtube_service_passes_authorized_http_to_googleapiclient(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "token.json").write_text("{}", encoding="utf-8")
+            FakeCredentials.instance = FakeCredentials(valid=True, expired=False)
+            authorized_http = object()
+
+            service, err = yc.get_youtube_service(
+                base_dir=root,
+                credentials_cls=FakeCredentials,
+                http_factory=lambda credentials: (authorized_http, None),
+                build_func=lambda service_name, version, http: {
+                    "service_name": service_name,
+                    "version": version,
+                    "http": http,
+                },
+            )
+
+            self.assertIsNone(err)
+            self.assertEqual(service["service_name"], "youtube")
+            self.assertEqual(service["version"], "v3")
+            self.assertIs(service["http"], authorized_http)
 
     def test_refreshes_expired_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

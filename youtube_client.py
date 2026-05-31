@@ -66,6 +66,31 @@ def oauth_credentials_missing(credentials_path: str | Path = CREDENTIALS_PATH) -
     )
 
 
+def get_certifi_bundle_path(
+    certifi_where: Callable[[], str] | None = None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    if certifi_where is None:
+        try:
+            import certifi
+        except ImportError:
+            return None, {
+                "configured": False,
+                "reason": "certifi_missing",
+                "hint": "run: pip install -r requirements.txt",
+            }
+
+        certifi_where = certifi.where
+
+    try:
+        return str(certifi_where()), None
+    except Exception as exc:
+        return None, {
+            "configured": False,
+            "reason": "certifi_unavailable",
+            "message": str(exc),
+        }
+
+
 def configure_ssl_certificates(
     certifi_where: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
@@ -74,28 +99,11 @@ def configure_ssl_certificates(
     source = "environment" if bundle_path else "certifi"
 
     if bundle_path is None:
-        if certifi_where is None:
-            try:
-                import certifi
-            except ImportError:
-                return {
-                    "configured": False,
-                    "reason": "certifi_missing",
-                    "hint": "run: pip install -r requirements.txt",
-                }
+        bundle_path, error = get_certifi_bundle_path(certifi_where)
+        if error:
+            return error
 
-            certifi_where = certifi.where
-
-        try:
-            bundle_path = certifi_where()
-        except Exception as exc:
-            return {
-                "configured": False,
-                "reason": "certifi_unavailable",
-                "message": str(exc),
-            }
-
-    bundle_path = str(bundle_path)
+    assert bundle_path is not None
     for name in CERTIFICATE_ENV_VARS:
         os.environ.setdefault(name, bundle_path)
 
@@ -105,6 +113,70 @@ def configure_ssl_certificates(
         "source": source,
         "env_vars": list(CERTIFICATE_ENV_VARS),
     }
+
+
+def build_certified_refresh_request(
+    request_cls: Any | None = None,
+    session_factory: Callable[[], Any] | None = None,
+    certifi_where: Callable[[], str] | None = None,
+) -> tuple[Any | None, dict[str, Any] | None]:
+    """Create a google-auth Requests transport pinned to certifi's CA bundle."""
+    bundle_path, bundle_error = get_certifi_bundle_path(certifi_where)
+    if bundle_error:
+        return None, bundle_error
+    assert bundle_path is not None
+
+    if request_cls is None:
+        try:
+            from google.auth.transport.requests import Request
+        except ImportError:
+            return None, dependency_missing("google-auth")
+
+        request_cls = Request
+
+    if session_factory is None:
+        try:
+            import requests
+        except ImportError:
+            return None, dependency_missing("requests")
+
+        session_factory = requests.Session
+
+    session = session_factory()
+    session.verify = bundle_path
+    return request_cls(session=session), None
+
+
+def build_authorized_http(
+    credentials: Any,
+    http_cls: Any | None = None,
+    authorized_http_cls: Any | None = None,
+    certifi_where: Callable[[], str] | None = None,
+) -> tuple[Any | None, dict[str, Any] | None]:
+    """Create an AuthorizedHttp for googleapiclient using certifi for TLS verification."""
+    bundle_path, bundle_error = get_certifi_bundle_path(certifi_where)
+    if bundle_error:
+        return None, bundle_error
+    assert bundle_path is not None
+
+    if http_cls is None:
+        try:
+            import httplib2
+        except ImportError:
+            return None, dependency_missing("httplib2")
+
+        http_cls = httplib2.Http
+
+    if authorized_http_cls is None:
+        try:
+            from google_auth_httplib2 import AuthorizedHttp
+        except ImportError:
+            return None, dependency_missing("google-auth-httplib2")
+
+        authorized_http_cls = AuthorizedHttp
+
+    http = http_cls(ca_certs=bundle_path)
+    return authorized_http_cls(credentials, http=http), None
 
 
 def _find_chrome_executable() -> str | None:
@@ -281,6 +353,7 @@ def get_youtube_service(
     credentials_cls: Any | None = None,
     request_factory: Callable[[], Any] | None = None,
     build_func: Callable[..., Any] | None = None,
+    http_factory: Callable[[Any], tuple[Any | None, dict[str, Any] | None]] | None = None,
     auto_authorize: bool = True,
     authorize_func: Callable[[str | Path], tuple[Any | None, dict[str, Any] | None]] | None = None,
 ) -> tuple[Any | None, dict[str, Any] | None]:
@@ -308,14 +381,13 @@ def get_youtube_service(
     if creds is not None and getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
         try:
             if request_factory is None:
-                try:
-                    from google.auth.transport.requests import Request
-                except ImportError:
-                    return None, dependency_missing("google-auth")
+                refresh_request, refresh_error = build_certified_refresh_request()
+                if refresh_error:
+                    return None, refresh_error
+            else:
+                refresh_request = request_factory()
 
-                request_factory = Request
-
-            creds.refresh(request_factory())
+            creds.refresh(refresh_request)
             token_path.write_text(creds.to_json(), encoding="utf-8")
         except Exception:
             creds = None
@@ -337,7 +409,8 @@ def get_youtube_service(
                 hint="Try running python authorize.py.",
             )
 
-    if build_func is None:
+    default_build = build_func is None
+    if default_build:
         try:
             from googleapiclient.discovery import build
         except ImportError:
@@ -346,6 +419,15 @@ def get_youtube_service(
         build_func = build
 
     try:
+        if default_build or http_factory is not None:
+            if http_factory is None:
+                authorized_http, http_error = build_authorized_http(creds)
+            else:
+                authorized_http, http_error = http_factory(creds)
+            if http_error:
+                return None, http_error
+            return build_func("youtube", "v3", http=authorized_http), None
+
         return build_func("youtube", "v3", credentials=creds), None
     except Exception as exc:
         return None, normalize_http_error(exc)
