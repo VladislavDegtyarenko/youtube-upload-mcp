@@ -1,9 +1,6 @@
 {
-  "videos_dir": "E:/For_Reals/Youtube",
-  "thumbs_dir": "E:/For_Reals/Youtube",
-  "footer_template": "Discord → https://discord.gg/D2h7BfDRFc\n\nInstagram → https://instagram.com/kiriakov.motion\n\nBehance → https://behance.net/igor_kiriakov_cgi\n\nTelegram → https://t.me/igor_kiriakov",
-  "default_category_id": "22",
-  "default_language": "ru",
+  "videos_dir": "",
+  "thumbs_dir": "",
   "default_privacy": "private",
   "made_for_kids": false
 }

@@ -44,6 +44,12 @@ VALID_PRIVACY = {"private", "unlisted", "public"}
 MAX_TITLE_LENGTH = 100
 MAX_DESCRIPTION_LENGTH = 5000
 MAX_TAGS_TOTAL_LENGTH = 500
+
+# Last-resort fallbacks when the caller (skill/prompt) does not supply these.
+# Kept out of config.json on purpose: real users should not hand-edit JSON;
+# the skill asks for category, language, and footer links conversationally.
+DEFAULT_CATEGORY_ID = "27"
+DEFAULT_LANGUAGE = "en"
 MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024
 VALID_LICENSE = {"youtube", "creativeCommon"}
 VIDEO_DETAILS_PARTS = "snippet,status,recordingDetails,contentDetails,statistics"
@@ -688,8 +694,19 @@ def _list_pending_files(config_path: str | Path | None = None) -> dict[str, Any]
         return config_error
 
     assert config is not None
-    videos_dir = Path(config["videos_dir"]).expanduser()
-    thumbs_dir = Path(config["thumbs_dir"]).expanduser()
+    videos_value = config.get("videos_dir")
+    thumbs_value = config.get("thumbs_dir")
+    if not videos_value or not thumbs_value:
+        return yc.error_payload(
+            "queue_dir_not_configured",
+            hint=(
+                "No watched folder is configured. Set videos_dir and thumbs_dir in "
+                "config.json to scan a queue, or just pass a full path to upload_video."
+            ),
+        )
+
+    videos_dir = Path(videos_value).expanduser()
+    thumbs_dir = Path(thumbs_value).expanduser()
 
     if not videos_dir.is_dir():
         return yc.error_payload("directory_not_found", path=str(videos_dir))
@@ -864,6 +881,8 @@ def _upload_video(
     thumbnail_path: str | None = None,
     scheduled_time: str | None = None,
     privacy: str | None = None,
+    category_id: str | None = None,
+    language: str | None = None,
     youtube: Any | None = None,
     config_path: str | Path | None = None,
     media_upload_cls: Any | None = None,
@@ -874,13 +893,13 @@ def _upload_video(
         return config_error
     assert config is not None
 
-    video = _resolve_input_path(video_path, config["videos_dir"])
+    video = _resolve_input_path(video_path, config.get("videos_dir"))
     if not video.is_file():
         return yc.error_payload("file_not_found", path=str(video))
 
     thumbnail: Path | None = None
     if thumbnail_path:
-        thumbnail = _resolve_input_path(thumbnail_path, config["thumbs_dir"])
+        thumbnail = _resolve_input_path(thumbnail_path, config.get("thumbs_dir"))
         if not thumbnail.is_file():
             return yc.error_payload("file_not_found", path=str(thumbnail))
 
@@ -894,19 +913,27 @@ def _upload_video(
             details="title must be at most 100 characters",
         )
 
-    description_text = description if isinstance(description, str) else ""
-    final_description = description_text + str(config.get("footer_template", ""))
+    # The description is used verbatim. Any footer/social links are composed by
+    # the caller (skill/prompt) into this text; the server no longer appends a
+    # footer from config.json.
+    final_description = description if isinstance(description, str) else ""
     if len(final_description) > MAX_DESCRIPTION_LENGTH:
         return yc.error_payload(
             "validation_error",
             field="description",
-            details="description plus footer must be at most 5000 characters",
+            details="description must be at most 5000 characters",
         )
 
     clean_tags, tags_error = _normalize_tags(tags)
     if tags_error:
         return tags_error
     assert clean_tags is not None
+
+    category_text = str(category_id).strip() if category_id is not None else ""
+    effective_category_id = category_text or DEFAULT_CATEGORY_ID
+
+    language_text = str(language).strip() if language is not None else ""
+    effective_language = language_text or DEFAULT_LANGUAGE
 
     requested_privacy = privacy or config.get("default_privacy", "private")
     if requested_privacy not in VALID_PRIVACY:
@@ -956,8 +983,8 @@ def _upload_video(
             "title": title_text,
             "description": final_description,
             "tags": clean_tags,
-            "categoryId": str(config.get("default_category_id", "22")),
-            "defaultLanguage": str(config.get("default_language", "en")),
+            "categoryId": effective_category_id,
+            "defaultLanguage": effective_language,
         },
         "status": status_body,
     }
@@ -1064,8 +1091,23 @@ def upload_video(
     thumbnail_path: str | None = None,
     scheduled_time: str | None = None,
     privacy: str | None = None,
+    category_id: str | None = None,
+    language: str | None = None,
 ) -> Any:
-    """Upload a video with metadata, optional schedule, and optional thumbnail."""
+    """Upload a video with metadata, optional schedule, and optional thumbnail.
+
+    Before calling this, confirm the metadata with the user: title, description,
+    tags, category_id, and language. Do not invent these silently or upload with
+    empty tags — propose values, show them, and wait for the user's approval.
+
+    - description is used verbatim. If the user wants a footer with social/links,
+      ask them for it and include it in description yourself; the server does not
+      add one.
+    - category_id is a YouTube category number (e.g. "27" Education, "28" Science
+      & Technology, "22" People & Blogs). Falls back to "27" when omitted.
+    - language is the BCP-47 metadata language (e.g. "en", "ru"). Ask the user;
+      falls back to "en" when omitted.
+    """
     return _safe_call(
         _upload_video,
         video_path,
@@ -1075,6 +1117,8 @@ def upload_video(
         thumbnail_path,
         scheduled_time,
         privacy,
+        category_id,
+        language,
     )
 
 

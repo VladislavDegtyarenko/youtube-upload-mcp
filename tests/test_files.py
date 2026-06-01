@@ -32,10 +32,55 @@ class ConfigAndFileTests(unittest.TestCase):
             config, err = yc.load_config(config_path)
 
             self.assertIsNone(err)
-            self.assertEqual(config["default_category_id"], "22")
-            self.assertEqual(config["default_language"], "en")
             self.assertEqual(config["default_privacy"], "private")
             self.assertFalse(config["made_for_kids"])
+            # Category, language, and footer are no longer config-driven; the
+            # skill/prompt supplies them per upload.
+            self.assertNotIn("default_category_id", config)
+            self.assertNotIn("default_language", config)
+            self.assertNotIn("footer_template", config)
+
+    def test_load_config_allows_missing_queue_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps({"default_privacy": "unlisted"}), encoding="utf-8"
+            )
+
+            config, err = yc.load_config(config_path)
+
+            self.assertIsNone(err)
+            # videos_dir / thumbs_dir are optional; a user can pass full paths.
+            self.assertNotIn("videos_dir", config)
+            self.assertNotIn("thumbs_dir", config)
+            self.assertEqual(config["default_privacy"], "unlisted")
+
+    def test_load_config_ignores_empty_queue_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps({"videos_dir": "", "thumbs_dir": "   "}),
+                encoding="utf-8",
+            )
+
+            config, err = yc.load_config(config_path)
+
+            # Empty / whitespace-only values are treated as "not set", not errors.
+            self.assertIsNone(err)
+            self.assertNotIn("videos_dir", config)
+            self.assertNotIn("thumbs_dir", config)
+
+    def test_list_pending_files_reports_unconfigured_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps({}), encoding="utf-8")
+
+            result = server._list_pending_files(config_path)
+
+            self.assertEqual(result["error"], "queue_dir_not_configured")
 
     def test_list_pending_files_pairs_by_stem_and_prefers_jpg(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -20,9 +20,6 @@ SCOPES = [
 ]
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "footer_template": "",
-    "default_category_id": "22",
-    "default_language": "en",
     "default_privacy": "private",
     "made_for_kids": False,
 }
@@ -510,11 +507,19 @@ def load_config(
         return None, error_payload("config_invalid", details="config root must be an object")
 
     config = {**DEFAULT_CONFIG, **data}
-    for required in ("videos_dir", "thumbs_dir"):
-        if not isinstance(config.get(required), str) or not config[required].strip():
+    # videos_dir / thumbs_dir are optional "watched folder" hints used by
+    # list_pending_files and for resolving relative filenames. They are NOT
+    # required: a user can always pass a full path to the video/thumbnail, so a
+    # non-technical user never has to hand-edit JSON. An empty / whitespace-only
+    # string is treated as "not set" and ignored rather than raising an error.
+    for optional_dir in ("videos_dir", "thumbs_dir"):
+        value = config.get(optional_dir)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            config.pop(optional_dir, None)
+        elif not isinstance(value, str):
             return None, error_payload(
                 "config_invalid",
-                details=f"{required} must be a non-empty string",
+                details=f"{optional_dir} must be a string when set",
             )
 
     if config["default_privacy"] not in {"private", "unlisted", "public"}:

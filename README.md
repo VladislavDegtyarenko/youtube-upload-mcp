@@ -16,7 +16,7 @@ fallback.
 - `get_video_details(video_id)`
 - `edit_video(video_id, changes, dry_run=False)`
 - `bulk_edit_videos(video_ids=None, changes=None, edits=None, dry_run=True)`
-- `upload_video(video_path, title, description, tags, thumbnail_path=None, scheduled_time=None, privacy=None)`
+- `upload_video(video_path, title, description, tags, thumbnail_path=None, scheduled_time=None, privacy=None, category_id=None, language=None)`
 - `set_thumbnail(video_id, image_path)`
 - `get_channel_info()`
 
@@ -98,22 +98,31 @@ Advanced and continue to the app, then grant access. The script creates `token.j
 
 ## 6. Configure
 
-Edit `config.json`:
+`config.json` is optional — the server runs with an empty `{}` and OAuth handles
+the rest. You only need it to change defaults or to use a watched folder:
 
 ```json
 {
   "videos_dir": "E:/YouTube/queue/videos",
   "thumbs_dir": "E:/YouTube/queue/thumbs",
-  "footer_template": "\n\n---\nInstagram: https://...\nPortfolio: https://...\nTikTok: https://...",
-  "default_category_id": "27",
-  "default_language": "en",
   "default_privacy": "private",
   "made_for_kids": false
 }
 ```
 
-`upload_video` also accepts relative filenames. For relative video paths, it checks
-`videos_dir`; for relative thumbnail paths, it checks `thumbs_dir`.
+`config.json` holds only environment settings, and every key is optional:
+
+- `videos_dir` / `thumbs_dir` — an optional **watched folder**. When set,
+  `list_pending_files` scans it and relative filenames resolve against it. When
+  absent, just pass a full path to `upload_video` (absolute paths always work),
+  so a non-technical user never has to hand-edit JSON. `list_pending_files`
+  returns `queue_dir_not_configured` if you call it without these set.
+- Per-video metadata — category, metadata language, and any footer/social links
+  in the description — is supplied at call time through `upload_video`'s
+  `category_id` and `language` arguments and the `description` text. The
+  `youtube-upload` skill prompts for these. When `category_id`/`language` are
+  omitted, they fall back to `27` (Education) and `en`. The server does not
+  append a footer; include any links in `description` yourself.
 
 ## 7. Connect To Claude Desktop
 

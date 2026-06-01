@@ -87,9 +87,6 @@ def write_config(root: Path, videos: Path, thumbs: Path, **extra) -> Path:
     config = {
         "videos_dir": str(videos),
         "thumbs_dir": str(thumbs),
-        "footer_template": "\n\nFooter",
-        "default_category_id": "22",
-        "default_language": "ru",
         "default_privacy": "private",
         "made_for_kids": False,
         **extra,
@@ -200,7 +197,7 @@ class ToolTests(unittest.TestCase):
             body = youtube.insert_kwargs["body"]
             self.assertEqual(body["status"]["privacyStatus"], "private")
             self.assertEqual(body["status"]["publishAt"], "2026-06-01T18:00:00+03:00")
-            self.assertEqual(body["snippet"]["description"], "Description\n\nFooter")
+            self.assertEqual(body["snippet"]["description"], "Description")
             self.assertEqual(result["video_id"], "uploaded123")
             self.assertFalse(result["thumbnail_set"])
             self.assertEqual(result["warnings"][0]["code"], "privacy_forced_private")
@@ -229,6 +226,81 @@ class ToolTests(unittest.TestCase):
 
             self.assertNotIn("publishAt", youtube.insert_kwargs["body"]["status"])
             self.assertFalse(result["thumbnail_set"])
+
+    def test_upload_works_without_configured_queue_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "clip.mp4").write_text("video", encoding="utf-8")
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps({"default_privacy": "private", "made_for_kids": False}),
+                encoding="utf-8",
+            )
+            youtube = FakeYouTube()
+
+            result = server._upload_video(
+                str(root / "clip.mp4"),
+                "Title",
+                "Description",
+                [],
+                youtube=youtube,
+                config_path=config_path,
+                media_upload_cls=FakeMediaUpload,
+            )
+
+            self.assertEqual(result["video_id"], "uploaded123")
+
+    def test_upload_uses_explicit_category_and_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            videos = root / "videos"
+            thumbs = root / "thumbs"
+            videos.mkdir()
+            thumbs.mkdir()
+            (videos / "clip.mp4").write_text("video", encoding="utf-8")
+            config_path = write_config(root, videos, thumbs)
+            youtube = FakeYouTube()
+
+            server._upload_video(
+                str(videos / "clip.mp4"),
+                "Title",
+                "Description",
+                [],
+                category_id="28",
+                language="ru",
+                youtube=youtube,
+                config_path=config_path,
+                media_upload_cls=FakeMediaUpload,
+            )
+
+            snippet = youtube.insert_kwargs["body"]["snippet"]
+            self.assertEqual(snippet["categoryId"], "28")
+            self.assertEqual(snippet["defaultLanguage"], "ru")
+
+    def test_upload_falls_back_to_default_category_and_language_when_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            videos = root / "videos"
+            thumbs = root / "thumbs"
+            videos.mkdir()
+            thumbs.mkdir()
+            (videos / "clip.mp4").write_text("video", encoding="utf-8")
+            config_path = write_config(root, videos, thumbs)
+            youtube = FakeYouTube()
+
+            server._upload_video(
+                str(videos / "clip.mp4"),
+                "Title",
+                "Description",
+                [],
+                youtube=youtube,
+                config_path=config_path,
+                media_upload_cls=FakeMediaUpload,
+            )
+
+            snippet = youtube.insert_kwargs["body"]["snippet"]
+            self.assertEqual(snippet["categoryId"], "27")
+            self.assertEqual(snippet["defaultLanguage"], "en")
 
 
 if __name__ == "__main__":
