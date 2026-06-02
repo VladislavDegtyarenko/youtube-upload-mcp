@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
+import uuid
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -8,15 +11,16 @@ from typing import Any
 
 try:
     from mcp.server.fastmcp import FastMCP
+    from mcp.types import Icon
 except ImportError:
     class FastMCP:  # type: ignore[no-redef]
         """Tiny import-time fallback for tests before runtime deps are installed."""
 
-        def __init__(self, name: str):
+        def __init__(self, name: str, **_kwargs: Any):
             self.name = name
             self.tools: dict[str, Any] = {}
 
-        def tool(self):
+        def tool(self, *_args: Any, **_kwargs: Any):
             def decorator(func):
                 self.tools[func.__name__] = func
                 return func
@@ -25,6 +29,8 @@ except ImportError:
 
         def run(self, transport: str = "stdio") -> None:
             raise RuntimeError("Install dependencies first: pip install -r requirements.txt")
+
+    Icon = None  # type: ignore[assignment, misc]
 
 try:
     from . import youtube_client as yc
@@ -35,7 +41,30 @@ except ImportError:
 # antivirus/proxy HTTPS interception is handled transparently for every API call.
 yc.enable_os_trust_store()
 
-mcp = FastMCP("youtube-automation")
+# Red YouTube glyph (official play-button mark) embedded as a self-contained SVG
+# data URI so the icon ships with the server and needs no external hosting.
+YOUTUBE_ICON_SRC = (
+    "data:image/svg+xml;base64,"
+    "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAy"
+    "NCI+PHBhdGggZmlsbD0iI0ZGMDAwMCIgZD0iTTIzLjQ5OCA2LjE4NmEzLjAxNiAzLjAxNiAwIDAg"
+    "MC0yLjEyMi0yLjEzNkMxOS41MDUgMy41NDUgMTIgMy41NDUgMTIgMy41NDVzLTcuNTA1IDAtOS4z"
+    "NzcuNTA1QTMuMDE3IDMuMDE3IDAgMCAwIC41MDIgNi4xODZDMCA4LjA3IDAgMTIgMCAxMnMwIDMu"
+    "OTMuNTAyIDUuODE0YTMuMDE2IDMuMDE2IDAgMCAwIDIuMTIyIDIuMTM2YzEuODcxLjUwNSA5LjM3"
+    "Ni41MDUgOS4zNzYuNTA1czcuNTA1IDAgOS4zNzctLjUwNWEzLjAxNSAzLjAxNSAwIDAgMCAyLjEy"
+    "Mi0yLjEzNkMyNCAxNS45MyAyNCAxMiAyNCAxMnMwLTMuOTMtLjUwMi01LjgxNHoiLz48cGF0aCBm"
+    "aWxsPSIjZmZmIiBkPSJNOS41NDUgMTUuNTY4VjguNDMyTDE1LjgxOCAxMmwtNi4yNzMgMy41Njh6"
+    "Ii8+PC9zdmc+"
+)
+
+# Shared icon list reused for the server and every tool so the red YouTube mark
+# is visible on the server itself and on each individual operation.
+YOUTUBE_ICONS = (
+    [Icon(src=YOUTUBE_ICON_SRC, mimeType="image/svg+xml", sizes=["any"])]
+    if Icon is not None
+    else None
+)
+
+mcp = FastMCP("youtube-automation", icons=YOUTUBE_ICONS)
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 THUMBNAIL_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -44,6 +73,8 @@ VALID_PRIVACY = {"private", "unlisted", "public"}
 MAX_TITLE_LENGTH = 100
 MAX_DESCRIPTION_LENGTH = 5000
 MAX_TAGS_TOTAL_LENGTH = 500
+MAX_PLAYLIST_TITLE_LENGTH = 150
+MAX_PLAYLIST_DESCRIPTION_LENGTH = 5000
 
 # Last-resort fallbacks when the caller (skill/prompt) does not supply these.
 # Kept out of config.json on purpose: real users should not hand-edit JSON;
@@ -97,6 +128,56 @@ def _safe_call(func, *args, **kwargs) -> Any:
         return func(*args, **kwargs)
     except Exception as exc:
         return yc.error_payload("internal_error", message=str(exc))
+
+
+# Background upload jobs. A multi-gigabyte upload takes far longer than an MCP
+# client's per-request timeout, so upload_video must not block the request for the
+# whole transfer. Instead it starts the upload on a daemon thread, returns a job_id
+# immediately, and the client polls get_upload_status until it finishes. This is
+# robust regardless of whether the client resets its timeout on progress.
+_UPLOAD_JOBS: dict[str, dict[str, Any]] = {}
+_UPLOAD_JOBS_LOCK = threading.Lock()
+_MAX_TRACKED_JOBS = 50
+
+
+def _prune_upload_jobs_locked() -> None:
+    """Drop the oldest finished jobs so the registry cannot grow without bound."""
+    if len(_UPLOAD_JOBS) <= _MAX_TRACKED_JOBS:
+        return
+    finished = [
+        (job.get("updated_at", 0.0), jid)
+        for jid, job in _UPLOAD_JOBS.items()
+        if job.get("status") in ("completed", "error")
+    ]
+    finished.sort()
+    for _, jid in finished[: len(_UPLOAD_JOBS) - _MAX_TRACKED_JOBS]:
+        _UPLOAD_JOBS.pop(jid, None)
+
+
+def _update_job(job_id: str, **fields: Any) -> None:
+    with _UPLOAD_JOBS_LOCK:
+        job = _UPLOAD_JOBS.get(job_id)
+        if job is None:
+            return
+        job.update(fields)
+        job["updated_at"] = time.time()
+
+
+def _run_upload_job(job_id: str, args: tuple[Any, ...]) -> None:
+    def progress_callback(percent: int, uploaded: int | None, total: int | None) -> None:
+        fields: dict[str, Any] = {"progress_percent": percent}
+        if uploaded is not None:
+            fields["uploaded_bytes"] = uploaded
+        if total is not None:
+            fields["total_bytes"] = total
+        _update_job(job_id, **fields)
+
+    result = _safe_call(_upload_video, *args, progress_callback=progress_callback)
+
+    if isinstance(result, dict) and "error" in result:
+        _update_job(job_id, status="error", result=result)
+    else:
+        _update_job(job_id, status="completed", progress_percent=100, result=result)
 
 
 def _service_or_error(youtube: Any | None = None) -> tuple[Any | None, dict[str, Any] | None]:
@@ -688,6 +769,408 @@ def _list_channel_videos(
         "next_page_token": playlist_response.get("nextPageToken"),
     }
 
+def _list_playlists(
+    max_results: int = 50,
+    page_token: str | None = None,
+    youtube: Any | None = None,
+) -> dict[str, Any]:
+    try:
+        limit = int(max_results)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 50))
+
+    service, service_error = _service_or_error(youtube)
+    if service_error:
+        return service_error
+
+    kwargs: dict[str, Any] = {
+        "part": "snippet,contentDetails,status",
+        "mine": True,
+        "maxResults": limit,
+    }
+    if page_token:
+        kwargs["pageToken"] = page_token
+
+    try:
+        response = _execute(service.playlists().list(**kwargs))
+    except Exception as exc:
+        return yc.normalize_http_error(exc)
+
+    playlists = []
+    for item in response.get("items", []):
+        snippet = item.get("snippet", {})
+        playlists.append(
+            {
+                "playlist_id": item.get("id"),
+                "title": snippet.get("title"),
+                "description": snippet.get("description"),
+                "item_count": item.get("contentDetails", {}).get("itemCount"),
+                "privacy": item.get("status", {}).get("privacyStatus"),
+            }
+        )
+
+    return {
+        "playlists": playlists,
+        "next_page_token": response.get("nextPageToken"),
+    }
+
+
+def _add_video_to_playlist(
+    video_id: str,
+    playlist_id: str,
+    youtube: Any | None = None,
+) -> dict[str, Any]:
+    video = video_id.strip() if isinstance(video_id, str) else ""
+    if not video:
+        return yc.error_payload(
+            "validation_error", field="video_id", details="video_id is required"
+        )
+    playlist = playlist_id.strip() if isinstance(playlist_id, str) else ""
+    if not playlist:
+        return yc.error_payload(
+            "validation_error", field="playlist_id", details="playlist_id is required"
+        )
+
+    service, service_error = _service_or_error(youtube)
+    if service_error:
+        return service_error
+
+    body = {
+        "snippet": {
+            "playlistId": playlist,
+            "resourceId": {"kind": "youtube#video", "videoId": video},
+        }
+    }
+
+    try:
+        response = _execute(service.playlistItems().insert(part="snippet", body=body))
+    except Exception as exc:
+        return yc.normalize_http_error(exc)
+
+    return {
+        "playlist_item_id": response.get("id"),
+        "playlist_id": playlist,
+        "video_id": video,
+    }
+
+
+def _serialize_playlist(item: dict[str, Any]) -> dict[str, Any]:
+    snippet = item.get("snippet", {})
+    return {
+        "playlist_id": item.get("id", ""),
+        "title": snippet.get("title", ""),
+        "description": snippet.get("description", ""),
+        "privacy": item.get("status", {}).get("privacyStatus", ""),
+    }
+
+
+def _fetch_playlist(
+    service: Any,
+    playlist_id: str,
+    parts: str = "snippet,status",
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    try:
+        response = _execute(service.playlists().list(part=parts, id=playlist_id))
+    except Exception as exc:
+        return None, yc.normalize_http_error(exc)
+
+    items = response.get("items", [])
+    if not items:
+        return None, yc.error_payload("playlist_not_found", playlist_id=playlist_id)
+    return items[0], None
+
+
+def _create_playlist(
+    title: str,
+    description: str = "",
+    privacy: str = "private",
+    youtube: Any | None = None,
+) -> dict[str, Any]:
+    title_text = title.strip() if isinstance(title, str) else ""
+    if not title_text:
+        return yc.error_payload("validation_error", field="title", details="title is required")
+    if len(title_text) > MAX_PLAYLIST_TITLE_LENGTH:
+        return yc.error_payload(
+            "validation_error",
+            field="title",
+            details="title must be at most 150 characters",
+        )
+
+    description_text = description if isinstance(description, str) else ""
+    if len(description_text) > MAX_PLAYLIST_DESCRIPTION_LENGTH:
+        return yc.error_payload(
+            "validation_error",
+            field="description",
+            details="description must be at most 5000 characters",
+        )
+
+    if privacy not in VALID_PRIVACY:
+        return yc.error_payload(
+            "validation_error",
+            field="privacy",
+            details="privacy must be private, unlisted, or public",
+        )
+
+    service, service_error = _service_or_error(youtube)
+    if service_error:
+        return service_error
+
+    body = {
+        "snippet": {"title": title_text, "description": description_text},
+        "status": {"privacyStatus": privacy},
+    }
+
+    try:
+        response = _execute(service.playlists().insert(part="snippet,status", body=body))
+    except Exception as exc:
+        return yc.normalize_http_error(exc)
+
+    return _serialize_playlist(response if isinstance(response, dict) else {})
+
+
+def _update_playlist(
+    playlist_id: str,
+    title: str | None = None,
+    description: str | None = None,
+    privacy: str | None = None,
+    youtube: Any | None = None,
+) -> dict[str, Any]:
+    if not isinstance(playlist_id, str) or not playlist_id.strip():
+        return yc.error_payload("validation_error", field="playlist_id", details="playlist_id is required")
+    clean_playlist_id = playlist_id.strip()
+
+    if title is None and description is None and privacy is None:
+        return yc.error_payload(
+            "validation_error",
+            field="changes",
+            details="provide at least one of title, description, or privacy",
+        )
+
+    title_text: str | None = None
+    if title is not None:
+        if not isinstance(title, str) or not title.strip():
+            return yc.error_payload("validation_error", field="title", details="title cannot be empty")
+        title_text = title.strip()
+        if len(title_text) > MAX_PLAYLIST_TITLE_LENGTH:
+            return yc.error_payload(
+                "validation_error",
+                field="title",
+                details="title must be at most 150 characters",
+            )
+
+    if description is not None:
+        if not isinstance(description, str):
+            return yc.error_payload("validation_error", field="description", details="description must be a string")
+        if len(description) > MAX_PLAYLIST_DESCRIPTION_LENGTH:
+            return yc.error_payload(
+                "validation_error",
+                field="description",
+                details="description must be at most 5000 characters",
+            )
+
+    if privacy is not None and privacy not in VALID_PRIVACY:
+        return yc.error_payload(
+            "validation_error",
+            field="privacy",
+            details="privacy must be private, unlisted, or public",
+        )
+
+    service, service_error = _service_or_error(youtube)
+    if service_error:
+        return service_error
+
+    item, fetch_error = _fetch_playlist(service, clean_playlist_id)
+    if fetch_error:
+        return fetch_error
+    assert item is not None
+
+    before = _serialize_playlist(item)
+    snippet = deepcopy(item.get("snippet", {}))
+    status = deepcopy(item.get("status", {}))
+
+    # playlists.update always requires snippet.title, so carry the existing title
+    # forward when only other fields change.
+    snippet["title"] = title_text if title_text is not None else snippet.get("title", "")
+    if description is not None:
+        snippet["description"] = description
+    changed_parts = ["snippet"]
+    body: dict[str, Any] = {
+        "id": clean_playlist_id,
+        "snippet": {"title": snippet["title"], "description": snippet.get("description", "")},
+    }
+    if privacy is not None:
+        status["privacyStatus"] = privacy
+        body["status"] = {"privacyStatus": privacy}
+        changed_parts.append("status")
+
+    try:
+        response = _execute(
+            service.playlists().update(part=",".join(changed_parts), body=body)
+        )
+    except Exception as exc:
+        return yc.normalize_http_error(exc)
+
+    after = _serialize_playlist(response if isinstance(response, dict) else {})
+    return {"playlist_id": clean_playlist_id, "updated": True, "before": before, "after": after}
+
+
+def _delete_playlist(playlist_id: str, youtube: Any | None = None) -> dict[str, Any]:
+    if not isinstance(playlist_id, str) or not playlist_id.strip():
+        return yc.error_payload("validation_error", field="playlist_id", details="playlist_id is required")
+    clean_playlist_id = playlist_id.strip()
+
+    service, service_error = _service_or_error(youtube)
+    if service_error:
+        return service_error
+
+    try:
+        _execute(service.playlists().delete(id=clean_playlist_id))
+    except Exception as exc:
+        return yc.normalize_http_error(exc)
+
+    return {"deleted": True, "playlist_id": clean_playlist_id}
+
+
+def _list_playlist_items(
+    playlist_id: str,
+    max_results: int = 50,
+    page_token: str | None = None,
+    youtube: Any | None = None,
+) -> dict[str, Any]:
+    if not isinstance(playlist_id, str) or not playlist_id.strip():
+        return yc.error_payload("validation_error", field="playlist_id", details="playlist_id is required")
+    clean_playlist_id = playlist_id.strip()
+
+    try:
+        limit = int(max_results)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 50))
+
+    service, service_error = _service_or_error(youtube)
+    if service_error:
+        return service_error
+
+    kwargs: dict[str, Any] = {
+        "part": "snippet,contentDetails",
+        "playlistId": clean_playlist_id,
+        "maxResults": limit,
+    }
+    if page_token:
+        kwargs["pageToken"] = page_token
+
+    try:
+        response = _execute(service.playlistItems().list(**kwargs))
+    except Exception as exc:
+        return yc.normalize_http_error(exc)
+
+    items = []
+    for item in response.get("items", []):
+        snippet = item.get("snippet", {})
+        resource_id = snippet.get("resourceId", {})
+        items.append(
+            {
+                "playlist_item_id": item.get("id", ""),
+                "video_id": resource_id.get("videoId")
+                or item.get("contentDetails", {}).get("videoId", ""),
+                "title": snippet.get("title", ""),
+                "position": snippet.get("position"),
+            }
+        )
+
+    return {
+        "playlist_id": clean_playlist_id,
+        "items": items,
+        "next_page_token": response.get("nextPageToken"),
+    }
+
+
+def _remove_from_playlist(playlist_item_id: str, youtube: Any | None = None) -> dict[str, Any]:
+    if not isinstance(playlist_item_id, str) or not playlist_item_id.strip():
+        return yc.error_payload(
+            "validation_error",
+            field="playlist_item_id",
+            details="playlist_item_id is required",
+        )
+    clean_item_id = playlist_item_id.strip()
+
+    service, service_error = _service_or_error(youtube)
+    if service_error:
+        return service_error
+
+    try:
+        _execute(service.playlistItems().delete(id=clean_item_id))
+    except Exception as exc:
+        return yc.normalize_http_error(exc)
+
+    return {"removed": True, "playlist_item_id": clean_item_id}
+
+
+def _move_playlist_item(
+    playlist_item_id: str,
+    position: int,
+    youtube: Any | None = None,
+) -> dict[str, Any]:
+    if not isinstance(playlist_item_id, str) or not playlist_item_id.strip():
+        return yc.error_payload(
+            "validation_error",
+            field="playlist_item_id",
+            details="playlist_item_id is required",
+        )
+    clean_item_id = playlist_item_id.strip()
+
+    if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+        return yc.error_payload(
+            "validation_error",
+            field="position",
+            details="position must be a non-negative integer (0 = first)",
+        )
+
+    service, service_error = _service_or_error(youtube)
+    if service_error:
+        return service_error
+
+    # playlistItems.update needs playlistId + resourceId in the body, so read the
+    # item first to learn which playlist and video it points at.
+    try:
+        lookup = _execute(service.playlistItems().list(part="snippet", id=clean_item_id))
+    except Exception as exc:
+        return yc.normalize_http_error(exc)
+
+    lookup_items = lookup.get("items", [])
+    if not lookup_items:
+        return yc.error_payload("playlist_item_not_found", playlist_item_id=clean_item_id)
+
+    snippet = lookup_items[0].get("snippet", {})
+    playlist_id = snippet.get("playlistId", "")
+    resource_id = snippet.get("resourceId", {})
+
+    body = {
+        "id": clean_item_id,
+        "snippet": {
+            "playlistId": playlist_id,
+            "resourceId": resource_id,
+            "position": position,
+        },
+    }
+
+    try:
+        response = _execute(service.playlistItems().update(part="snippet", body=body))
+    except Exception as exc:
+        return yc.normalize_http_error(exc)
+
+    result_snippet = response.get("snippet", {}) if isinstance(response, dict) else {}
+    return {
+        "playlist_item_id": clean_item_id,
+        "playlist_id": result_snippet.get("playlistId", playlist_id),
+        "video_id": result_snippet.get("resourceId", resource_id).get("videoId", "")
+        if isinstance(result_snippet.get("resourceId", resource_id), dict)
+        else "",
+        "position": result_snippet.get("position", position),
+    }
+
+
 def _list_pending_files(config_path: str | Path | None = None) -> dict[str, Any]:
     config, config_error = _load_config(config_path)
     if config_error:
@@ -883,10 +1366,12 @@ def _upload_video(
     privacy: str | None = None,
     category_id: str | None = None,
     language: str | None = None,
+    playlist_id: str | None = None,
     youtube: Any | None = None,
     config_path: str | Path | None = None,
     media_upload_cls: Any | None = None,
     thumbnail_func: Any | None = None,
+    progress_callback: Any | None = None,
 ) -> dict[str, Any]:
     config, config_error = _load_config(config_path)
     if config_error:
@@ -1004,6 +1489,18 @@ def _upload_video(
             if progress is not None and hasattr(progress, "progress"):
                 percent = int(progress.progress() * 100)
                 print(f"YouTube upload progress: {percent}%", file=sys.stderr)
+                if progress_callback is not None:
+                    # Each callback emits an MCP progress notification, which resets
+                    # the client's per-request timeout so large uploads do not trip
+                    # the default MCP request deadline. Never let it abort the upload.
+                    try:
+                        progress_callback(
+                            percent,
+                            getattr(progress, "resumable_progress", None),
+                            getattr(progress, "total_size", None),
+                        )
+                    except Exception:
+                        pass
     except Exception as exc:
         return yc.normalize_http_error(exc)
 
@@ -1032,47 +1529,147 @@ def _upload_video(
         else:
             thumbnail_set = True
 
+    added_to_playlist = False
+    playlist_target = playlist_id.strip() if isinstance(playlist_id, str) else ""
+    if playlist_target:
+        playlist_result = _add_video_to_playlist(
+            video_id, playlist_target, youtube=service
+        )
+        if isinstance(playlist_result, dict) and "error" in playlist_result:
+            warnings.append(
+                {
+                    "code": playlist_result["error"],
+                    "message": "Video uploaded, but it was not added to the playlist.",
+                    "details": playlist_result,
+                }
+            )
+        else:
+            added_to_playlist = True
+
     return {
         "video_id": video_id,
         "url": f"https://youtu.be/{video_id}",
         "status": effective_privacy,
         "scheduled_time": scheduled_time or None,
         "thumbnail_set": thumbnail_set,
+        "playlist_id": playlist_target or None,
+        "added_to_playlist": added_to_playlist,
         "warnings": warnings,
     }
 
 
-@mcp.tool()
+@mcp.tool(icons=YOUTUBE_ICONS)
 def list_pending_files() -> Any:
     """List queued videos, thumbnails, and filename-stem pairs from config paths."""
     return _safe_call(_list_pending_files)
 
 
-@mcp.tool()
+@mcp.tool(icons=YOUTUBE_ICONS)
 def search_competitors(query: str, max_results: int = 10) -> Any:
     """Search competitor videos and return metadata plus statistics."""
     return _safe_call(_search_competitors, query, max_results)
 
 
-@mcp.tool()
+@mcp.tool(icons=YOUTUBE_ICONS)
 def get_video_details(video_id: str) -> Any:
     """Get editable metadata, status, content details, and statistics for one video."""
     return _safe_call(_get_video_details, video_id)
 
 
-@mcp.tool()
+@mcp.tool(icons=YOUTUBE_ICONS)
 def list_channel_videos(max_results: int = 50, page_token: str | None = None) -> Any:
     """List uploaded channel videos with metadata useful for selecting edit targets."""
     return _safe_call(_list_channel_videos, max_results, page_token)
 
 
-@mcp.tool()
+@mcp.tool(icons=YOUTUBE_ICONS)
+def list_playlists(max_results: int = 50, page_token: str | None = None) -> Any:
+    """List the authenticated channel's playlists (id, title, item count, privacy).
+
+    Use this to offer the user real playlist choices before uploading. Each entry's
+    "playlist_id" is what you pass as playlist_id to upload_video or add_to_playlist.
+    """
+    return _safe_call(_list_playlists, max_results, page_token)
+
+
+@mcp.tool(icons=YOUTUBE_ICONS)
+def add_to_playlist(video_id: str, playlist_id: str) -> Any:
+    """Add an existing YouTube video to one of the channel's playlists."""
+    return _safe_call(_add_video_to_playlist, video_id, playlist_id)
+
+
+@mcp.tool(icons=YOUTUBE_ICONS)
+def create_playlist(title: str, description: str = "", privacy: str = "private") -> Any:
+    """Create a new playlist on the authenticated channel.
+
+    privacy is private, unlisted, or public (defaults to private). Returns the new
+    playlist_id, which can be passed to add_to_playlist or upload_video. Confirm the
+    title, description, and privacy with the user before calling.
+    """
+    return _safe_call(_create_playlist, title, description, privacy)
+
+
+@mcp.tool(icons=YOUTUBE_ICONS)
+def update_playlist(
+    playlist_id: str,
+    title: str | None = None,
+    description: str | None = None,
+    privacy: str | None = None,
+) -> Any:
+    """Rename a playlist or change its description/privacy.
+
+    Pass only the fields you want to change; omitted fields (None) are left as-is.
+    Returns before/after state. privacy must be private, unlisted, or public.
+    """
+    return _safe_call(_update_playlist, playlist_id, title, description, privacy)
+
+
+@mcp.tool(icons=YOUTUBE_ICONS)
+def delete_playlist(playlist_id: str) -> Any:
+    """Permanently delete one of the channel's playlists.
+
+    Destructive and irreversible (the videos themselves are not deleted, only the
+    playlist). Confirm explicitly with the user before calling.
+    """
+    return _safe_call(_delete_playlist, playlist_id)
+
+
+@mcp.tool(icons=YOUTUBE_ICONS)
+def list_playlist_items(playlist_id: str, max_results: int = 50, page_token: str | None = None) -> Any:
+    """List the videos in one playlist with their playlist_item_id and position.
+
+    The playlist_item_id is what you pass to remove_from_playlist and
+    move_playlist_item (the API addresses items by their own id, not by video_id).
+    """
+    return _safe_call(_list_playlist_items, playlist_id, max_results, page_token)
+
+
+@mcp.tool(icons=YOUTUBE_ICONS)
+def remove_from_playlist(playlist_item_id: str) -> Any:
+    """Remove one item from a playlist by its playlist_item_id.
+
+    Get the playlist_item_id from list_playlist_items. This removes the video from
+    the playlist only; the video itself is not deleted.
+    """
+    return _safe_call(_remove_from_playlist, playlist_item_id)
+
+
+@mcp.tool(icons=YOUTUBE_ICONS)
+def move_playlist_item(playlist_item_id: str, position: int) -> Any:
+    """Reorder a playlist item to a new zero-based position (0 = first).
+
+    Get the playlist_item_id from list_playlist_items.
+    """
+    return _safe_call(_move_playlist_item, playlist_item_id, position)
+
+
+@mcp.tool(icons=YOUTUBE_ICONS)
 def edit_video(video_id: str, changes: dict[str, Any], dry_run: bool = False) -> Any:
     """Edit mutable metadata and status fields for one existing YouTube video."""
     return _safe_call(_edit_video, video_id, changes, dry_run)
 
 
-@mcp.tool()
+@mcp.tool(icons=YOUTUBE_ICONS)
 def bulk_edit_videos(
     video_ids: list[str] | None = None,
     changes: dict[str, Any] | None = None,
@@ -1082,7 +1679,7 @@ def bulk_edit_videos(
     """Edit existing YouTube videos by explicit IDs, defaulting to dry-run."""
     return _safe_call(_bulk_edit_videos, video_ids, changes, edits, dry_run)
 
-@mcp.tool()
+@mcp.tool(icons=YOUTUBE_ICONS)
 def upload_video(
     video_path: str,
     title: str,
@@ -1093,8 +1690,15 @@ def upload_video(
     privacy: str | None = None,
     category_id: str | None = None,
     language: str | None = None,
+    playlist_id: str | None = None,
 ) -> Any:
-    """Upload a video with metadata, optional schedule, and optional thumbnail.
+    """Start a background video upload and return a job_id immediately.
+
+    The upload runs asynchronously so large files cannot trip the MCP client's
+    request timeout. This call returns at once with {"job_id", "status":
+    "uploading"}; you MUST then poll get_upload_status(job_id) until status is
+    "completed" (the final upload result, including video_id/url, is in "result")
+    or "error". Do not assume the upload succeeded just because this call returned.
 
     Before calling this, confirm the metadata with the user: title, description,
     tags, category_id, and language. Do not invent these silently or upload with
@@ -1107,9 +1711,27 @@ def upload_video(
       & Technology, "22" People & Blogs). Falls back to "27" when omitted.
     - language is the BCP-47 metadata language (e.g. "en", "ru"). Ask the user;
       falls back to "en" when omitted.
+    - playlist_id (optional) adds the video to that playlist after upload. Ask the
+      user up front whether to add it to a playlist; call list_playlists to show
+      real options. Omit/leave None to upload without any playlist. A failed
+      playlist add does not fail the upload — it surfaces as a warning in result.
     """
-    return _safe_call(
-        _upload_video,
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    with _UPLOAD_JOBS_LOCK:
+        _prune_upload_jobs_locked()
+        _UPLOAD_JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "uploading",
+            "progress_percent": 0,
+            "video_path": video_path,
+            "title": title,
+            "created_at": now,
+            "updated_at": now,
+            "result": None,
+        }
+
+    args = (
         video_path,
         title,
         description,
@@ -1119,16 +1741,46 @@ def upload_video(
         privacy,
         category_id,
         language,
+        playlist_id,
     )
+    thread = threading.Thread(target=_run_upload_job, args=(job_id, args), daemon=True)
+    thread.start()
+
+    return {
+        "job_id": job_id,
+        "status": "uploading",
+        "message": (
+            "Upload started in the background. Poll get_upload_status(job_id) until "
+            "status is 'completed' or 'error'."
+        ),
+    }
 
 
-@mcp.tool()
+@mcp.tool(icons=YOUTUBE_ICONS)
+def get_upload_status(job_id: str) -> Any:
+    """Return the current state of a background upload started by upload_video.
+
+    status is "uploading" (see progress_percent), "completed" (the final upload
+    result is under "result": video_id, url, thumbnail_set, warnings, ...), or
+    "error" (the error payload is under "result"). Poll every few seconds while
+    status is "uploading".
+    """
+    with _UPLOAD_JOBS_LOCK:
+        job = _UPLOAD_JOBS.get(job_id)
+        if job is None:
+            return yc.error_payload(
+                "not_found", message=f"No upload job with id {job_id!r}"
+            )
+        return deepcopy(job)
+
+
+@mcp.tool(icons=YOUTUBE_ICONS)
 def set_thumbnail(video_id: str, image_path: str) -> Any:
     """Set a custom thumbnail for an uploaded YouTube video."""
     return _safe_call(_set_thumbnail, video_id, image_path)
 
 
-@mcp.tool()
+@mcp.tool(icons=YOUTUBE_ICONS)
 def get_channel_info() -> Any:
     """Return the authenticated YouTube channel identity and high-level statistics."""
     return _safe_call(_get_channel_info)

@@ -129,6 +129,22 @@ quality, and compliance before going public. When scheduling, prefer the
 audience's active hours (checked in YouTube Analytics) over publishing
 immediately.
 
+### Playlist — ASK the user early  → `playlist_id`
+Adding a video to a playlist helps discoverability and binge-watching. The MCP
+**can** do this now, so make it part of the upfront questions (alongside
+privacy/schedule), not an afterthought. Offer two clear options:
+
+- **В плейлист** → call `list_playlists` to show the channel's real playlists,
+  let the user pick one, and pass its `playlist_id` to `upload_video`.
+- **Без плейлиста** → omit `playlist_id` (leave it `None`). This is fine and
+  should be an explicit, equal choice — never force a playlist.
+
+If the user wants a brand-new playlist that doesn't exist yet, the Data API
+exposed here only *adds to existing* playlists; tell them to create the playlist
+once in Studio, then it will appear in `list_playlists` for future uploads.
+A failed playlist add never fails the upload — it comes back as a warning in the
+result, so re-run `add_to_playlist(video_id, playlist_id)` if needed.
+
 ### Thumbnail  → `thumbnail_path` / `set_thumbnail`
 The thumbnail is SEO because it drives CTR. It should *reinforce* the title, not
 repeat it: one focus, high contrast, readable on a phone, minimal clutter, 2–3
@@ -144,8 +160,6 @@ tool for the following, so they must be done by hand in Studio:
   first, then convert it to a premiere by hand in Studio (or set it up at the
   scheduled time). Scheduling via `scheduled_time` is a normal timed publish, NOT
   a premiere.
-- **Playlist** — add the video to the right playlist (helps discoverability and
-  binge-watching). e.g. "JavaScript Projects for Beginners".
 - **Captions / subtitles** — even auto-captions; verify names, brands, tech
   terms (e.g. `localStorage`, `createElement`, `Vite`, `Next.js`) that auto-CC
   mangles.
@@ -185,9 +199,10 @@ Category:    27 (Education)
 Language:    en | ru | ...
 Privacy:     private (только я) | unlisted (по ссылке) | public (для всех)
 Schedule:    none | 2026-06-01T18:00:00+03:00   (timed publish, not a premiere)
+Playlist:    без плейлиста | <playlist title> (<playlist_id>)
 Thumbnail:   none | clip.jpg (1280×720, <2 MB)
 
-Manual in Studio after upload: premiere (if requested), playlist, captions check,
+Manual in Studio after upload: premiere (if requested), captions check,
 end screen, cards, pinned comment.
 ```
 
@@ -215,20 +230,33 @@ If unsure, propose the closest and let the user correct it.
    (including footer links only if the user supplied them) → confirm with the user.
    As part of this, **ask how to publish**: private / unlisted / public /
    schedule on a date. If they ask for a premiere, flag it as a manual Studio
-   step (section B) and upload private/unlisted instead.
+   step (section B) and upload private/unlisted instead. Also **ask about the
+   playlist up front**: "в плейлист" (call `list_playlists`, let them pick) or
+   "без плейлиста".
 3. `upload_video(video_path, title, description, tags, thumbnail_path,
-   scheduled_time, privacy, category_id, language)`.
-4. If `thumbnail_set: false` in the result, retry `set_thumbnail`.
-5. `get_video_details(video_id)` to confirm metadata landed.
-6. Remind the user of the Studio-only steps (section B).
-7. Schedule the iteration review (section C) at 48–72 h / 7 d / 28 d.
+   scheduled_time, privacy, category_id, language, playlist_id)`. This returns **immediately**
+   with `{job_id, status: "uploading"}` — the upload runs in the background so large
+   files don't hit the MCP request timeout. It is NOT done yet.
+4. Poll `get_upload_status(job_id)` every few seconds until `status` is
+   `"completed"` or `"error"`. While `"uploading"`, optionally report
+   `progress_percent` to the user. On `"completed"`, the real upload result
+   (`video_id`, `url`, `thumbnail_set`, `added_to_playlist`, `playlist_id`,
+   `warnings`) is under `result`. On `"error"`, the error payload is under
+   `result` — surface it to the user.
+5. If `thumbnail_set: false` in the result, retry `set_thumbnail`. If a playlist
+   was requested but `added_to_playlist: false`, retry `add_to_playlist`.
+6. `get_video_details(video_id)` to confirm metadata landed.
+7. Remind the user of the Studio-only steps (section B).
+8. Schedule the iteration review (section C) at 48–72 h / 7 d / 28 d.
 
 ## Editing existing videos
 
 `list_channel_videos` to find targets, then `edit_video` (single) or
 `bulk_edit_videos` (explicit IDs; defaults to `dry_run: true`). Omit fields to
 leave unchanged; `description: ""` / `tags: []` to clear. Confirm proposed
-changes before executing a non-dry-run bulk edit.
+changes before executing a non-dry-run bulk edit. To put an already-uploaded
+video into a playlist, use `add_to_playlist(video_id, playlist_id)` (get the
+`playlist_id` from `list_playlists`).
 
 ## Hard limits & cautions
 

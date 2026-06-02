@@ -141,6 +141,18 @@ Use the absolute path to `server.py`:
 
 On Windows, if `python` is not found, use the full path to `python.exe` or use `py`.
 
+### Large uploads and timeouts
+
+A multi-gigabyte upload takes far longer than an MCP client's per-request timeout, so
+`upload_video` does **not** block the request for the whole transfer. It starts the
+upload on a background thread and returns immediately with `{"job_id", "status":
+"uploading"}`. The client then polls `get_upload_status(job_id)` until `status` is
+`"completed"` (final result — `video_id`, `url`, … — under `result`) or `"error"`.
+
+This means uploads of any size are immune to `MCP error -32001: Request timed out`,
+regardless of the client's timeout behaviour. The background job lives only inside the
+running server process, so the upload is cancelled if the server is stopped mid-upload.
+
 ## 8. Verify
 
 1. In your MCP client, call `get_channel_info`.
